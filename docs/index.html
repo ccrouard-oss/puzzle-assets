@@ -91,15 +91,29 @@
     const raycaster=new THREE.Raycaster();
     const pointer=new THREE.Vector2();
     const tmpV3=new THREE.Vector3();
-    const dragPlane=new THREE.Plane(new THREE.Vector3(0,0,1),0); // plan Z=0
 
-    function screenToWorldOnPlane(x,y,plane,out){
+    // --- Drag plane dynamique + offset en LOCAL(parent) ---
+    let dragPlane = null;                         // créé à chaque pointerDown (aligné à l'écran)
+    const dragOffsetLocal = new THREE.Vector3();  // offset conservé en local(parent)
+
+    function screenToWorldOnPlane(clientX, clientY, plane, out){
       const rect=renderer.domElement.getBoundingClientRect();
-      pointer.x=((x-rect.left)/rect.width)*2-1;
-      pointer.y=-((y-rect.top)/rect.height)*2+1;
+      pointer.x=((clientX-rect.left)/rect.width)*2-1;
+      pointer.y=-((clientY-rect.top)/rect.height)*2+1;
       raycaster.setFromCamera(pointer,camera);
       raycaster.ray.intersectPlane(plane,out);
       return out;
+    }
+
+    // Plan de drag aligné à l'écran, passant par un point monde donné
+    function makeScreenDragPlane(camera, worldPoint) {
+      const n = camera.getWorldDirection(new THREE.Vector3());
+      return new THREE.Plane().setFromNormalAndCoplanarPoint(n, worldPoint);
+    }
+    // Convertit un point monde en local du parent de l'objet
+    function worldToParentLocal(obj, worldPoint) {
+      const parent = obj.parent || scene;
+      return parent.worldToLocal(worldPoint.clone());
     }
 
     // --------- Orientation auto : “à plat de face” ----------
@@ -130,6 +144,10 @@
 
       // Oriente automatiquement pour garantir une vue de face (pièces visibles)
       orientFlatToXY(puzzleRoot);
+
+      // Stabiliser le parent (meilleure précision pour conversions monde/local)
+      puzzleRoot.updateMatrixWorld(true);
+      puzzleRoot.matrixAutoUpdate = false;
 
       // Récup des pièces (groupes/meshes)
       const meshes=[];
@@ -199,7 +217,6 @@
 
     let dragging=null;
     let dragStartPos=null;
-    const dragOffset=new THREE.Vector3();
 
     function getPoint(e){ return e.touches?.[0] || e.changedTouches?.[0] || e; }
     function setPointer(x,y){
@@ -224,27 +241,40 @@
           return root && !(root.userData && root.userData.locked);
         });
 
-      if (hits.length) {
-        const rootMesh  = findPieceRoot(hits[0].object);
-        const entry     = pieces.find(p => p.mesh === rootMesh);
-        if (entry) {
-          dragging = entry;
-          dragStartPos = entry.mesh.position.clone();
-          controls.enabled = false; // évite conflit caméra
-          const world = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
-          dragOffset.copy(dragging.mesh.position).sub(world);
-        }
-      }
+      if (!hits.length) return;
+
+      const rootMesh  = findPieceRoot(hits[0].object);
+      const entry     = pieces.find(p => p.mesh === rootMesh);
+      if (!entry) return;
+
+      dragging = entry;
+      dragStartPos = entry.mesh.position.clone();
+      controls.enabled = false; // éviter conflit caméra
+
+      // plan de drag aligné à l'écran, passant par la position MONDE de la pièce
+      const pieceWorld = new THREE.Vector3();
+      entry.mesh.getWorldPosition(pieceWorld);
+      dragPlane = makeScreenDragPlane(camera, pieceWorld);
+
+      // point monde sous le curseur → local(parent) + offset local
+      const worldHit = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
+      const localHit = worldToParentLocal(entry.mesh, worldHit);
+      dragOffsetLocal.copy(entry.mesh.position).sub(localHit);
     }
 
     function pointerMove(e){
       if (!dragging) return;
       const { clientX, clientY } = getPoint(e);
-      const world = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
-      world.add(dragOffset);
 
-      dragging.mesh.position.lerp(world, LERP_ALPHA_DRAG); // drag fluide
-      tryMagnet(dragging);                                  // aimantation continue
+      // Intersection monde sur le plan dynamique
+      const worldHit = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
+
+      // Conversion en local(parent) puis application (lerp)
+      const localHit = worldToParentLocal(dragging.mesh, worldHit).add(dragOffsetLocal);
+      dragging.mesh.position.lerp(localHit, LERP_ALPHA_DRAG);
+
+      // Aimantation en continu
+      tryMagnet(dragging);
     }
 
     function pointerUp(){
@@ -255,7 +285,6 @@
         if (!dragging.placed && overlapsAny(dragging)) {
           dragging.mesh.position.copy(dragStartPos);
         }
-
         dragging = null;
       }
       controls.enabled = true;
@@ -317,7 +346,6 @@
       camera.aspect=window.innerWidth/window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth,window.innerHeight);
-      // recadre si on a déjà la bbox
       if (currentBBox) frameFrontView(currentBBox);
     });
 
