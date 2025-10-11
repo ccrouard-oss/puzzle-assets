@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Puzzle 3D – Protect the Oceans</title>
+<style>
+  html,body {margin:0;height:100%;background:#0f172a;color:#e5e7eb;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif}
+  #app {position:fixed; inset:0}
+  #hud {position:fixed; left:16px; top:12px; z-index:10; background:rgba(0,0,0,.35); padding:8px 10px; border-radius:8px; font-size:14px}
+  #win {position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(0,0,0,.6); font-weight:600; font-size:20px}
+  canvas {display:block; width:100%; height:100%}
+  .kbd {padding:1px 6px; border:1px solid #94a3b8; border-radius:6px; font-size:12px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="hud">🧩 Déplacez les pièces (clic + glisser) • Zoom molette • <span class="kbd">R</span> pour réinitialiser caméra</div>
+<div id="win">🎉 Puzzle complété !</div>
+
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+const ROWS = 5, COLS = 10;
+const BOARD_W = 3.0, BOARD_H = 4.0;
+const SNAP_DIST = 0.12;            // distance d’aimantation
+const SNAP_MS = 180;               // vitesse d’aimantation
+const WIN_EPS = 0.01;              // tolérance victoire
+
+// --- scène ---
+const host = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+resize(); host.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0f172a);
+
+const camera = new THREE.PerspectiveCamera(45, host.clientWidth/host.clientHeight, 0.01, 100);
+camera.position.set(0, 0, 6);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.enablePan = false;
+controls.target.set(0, 0, 0);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+dir.position.set(1,1,2);
+scene.add(dir);
+
+// --- utilitaires ---
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1), 0);
+const hitPoint = new THREE.Vector3();
+
+function ndcFromEvent(ev){
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((ev.clientX - rect.left)/rect.width) * 2 - 1;
+  mouse.y = -((ev.clientY - rect.top)/rect.height) * 2 + 1;
+}
+
+function gridStep(){ return {dx: BOARD_W/COLS, dy: BOARD_H/ROWS}; }
+function homeFor(r,c){
+  const s = gridStep();
+  const x0 = -BOARD_W/2 + c*s.dx, y0 = -BOARD_H/2 + r*s.dy;
+  return new THREE.Vector3(x0 + s.dx*0.5, y0 + s.dy*0.5, 0);
+}
+function parseRC(name){
+  const m = name.match(/Piece_(\d+)_(\d+)/);
+  return m ? {r:parseInt(m[1],10), c:parseInt(m[2],10)} : {r:0,c:0};
+}
+
+// --- chargement du GLB (placé dans le même dossier que cette page) ---
+const loader = new GLTFLoader();
+const pieces = [];
+loader.load('./puzzle_50_scattered.glb', (gltf)=>{
+  scene.add(gltf.scene);
+  gltf.scene.traverse(o=>{
+    if(o.isMesh && /^Piece_\d+_\d+/.test(o.name)){
+      const {r,c} = parseRC(o.name);
+      o.userData.r = r; o.userData.c = c;
+      o.userData.home = homeFor(r,c);
+      o.userData.homeQuat = new THREE.Quaternion(); // rotation nulle
+      pieces.push(o);
+    }
+  });
+  console.log('✅ Pièces détectées :', pieces.length);
+}, undefined, (err)=>console.error('❌ Erreur chargement GLB :', err));
+
+// --- interaction ---
+let dragging = null, dragOffset = new THREE.Vector3();
+renderer.domElement.addEventListener('pointerdown', onDown);
+renderer.domElement.addEventListener('pointermove', onMove);
+renderer.domElement.addEventListener('pointerup', onUp);
+window.addEventListener('resize', resize);
+window.addEventListener('keydown', e=>{
+  if(e.key.toLowerCase()==='r'){
+    camera.position.set(0,0,6); controls.target.set(0,0,0);
+  }
+});
+
+function pick(){
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(pieces, false);
+  return hits.length ? hits[0] : null;
+}
+function onDown(ev){
+  ndcFromEvent(ev);
+  const hit = pick();
+  if(!hit) return;
+  dragging = hit.object;
+  dragging.renderOrder = 999;       // passer devant
+  raycaster.ray.intersectPlane(dragPlane, hitPoint);
+  dragOffset.copy(hitPoint).sub(dragging.position);
+}
+function onMove(ev){
+  if(!dragging) return;
+  ndcFromEvent(ev);
+  raycaster.ray.intersectPlane(dragPlane, hitPoint);
+  const p = hitPoint.clone().sub(dragOffset);
+  p.z = 0.02;
+  dragging.position.copy(p);
+}
+function animateTo(obj, target, ms){
+  const start = obj.position.clone();
+  const t0 = performance.now();
+  function step(now){
+    const u = Math.min(1, (now - t0)/ms);
+    obj.position.lerpVectors(start, target, 1 - (1-u)*(1-u)); // easeOutQuad
+    if(u<1) requestAnimationFrame(step);
+    else checkWin();
+  }
+  requestAnimationFrame(step);
+}
+function onUp(){
+  if(!dragging) return;
+  // snap si proche de la maison ou d'un voisin snapé
+  const dHome = dragging.position.distanceTo(dragging.userData.home);
+  if(dHome <= SNAP_DIST){
+    animateTo(dragging, dragging.userData.home, SNAP_MS);
+  } else {
+    // snap doux vers la maison si très proche d’une autre pièce déjà à la maison
+    for(const p of pieces){
+      if(p===dragging) continue;
+      const near = p.position.distanceTo(dragging.position) <= SNAP_DIST;
+      const pAtHome = p.position.distanceTo(p.userData.home) <= WIN_EPS;
+      if(near && pAtHome){
+        animateTo(dragging, dragging.userData.home, SNAP_MS);
+        break;
+      }
+    }
+  }
+  dragging.renderOrder = 0;
+  dragging = null;
+}
+
+function checkWin(){
+  const allOk = pieces.length>0 && pieces.every(p=>{
+    return p.position.distanceTo(p.userData.home) <= WIN_EPS &&
+           Math.abs(1 - p.quaternion.dot(p.userData.homeQuat)) < 1e-3;
+  });
+  if(allOk){
+    document.getElementById('win').style.display = 'flex';
+  }
+}
+
+// --- boucle ---
+function resize(){
+  const w = host.clientWidth, h = host.clientHeight;
+  renderer.setSize(w,h);
+  camera.aspect = w/h; camera.updateProjectionMatrix();
+}
+(function loop(){
+  requestAnimationFrame(loop);
+  controls.update();
+  renderer.render(scene, camera);
+})();
+</script>
+</body>
+</html>
