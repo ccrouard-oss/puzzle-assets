@@ -19,12 +19,10 @@
 
   <!-- Three.js r160 -->
   <script type="importmap">
-  {
-    "imports": {
+  { "imports": {
       "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
       "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
-    }
-  }
+  } }
   </script>
 </head>
 <body>
@@ -65,8 +63,7 @@
     // Caméra : pile en FACE (axe +Z), vue libre ensuite
     const camera=new THREE.PerspectiveCamera(50,window.innerWidth/window.innerHeight,0.01,100);
     const PUZZLE_CENTER=new THREE.Vector3(0,0,0);
-    const START_DISTANCE = 6.0;
-    camera.position.set(0, 0, START_DISTANCE);
+    camera.position.set(0, 0, 6.0);
     camera.up.set(0,1,0);
     camera.lookAt(PUZZLE_CENTER);
 
@@ -105,18 +102,34 @@
       return out;
     }
 
+    // --------- Orientation auto : “à plat de face” ----------
+    function orientFlatToXY(root){
+      const candidates = [{rx:0},{rx: Math.PI/2},{rx:-Math.PI/2}];
+      let best = { rx:0, score: Infinity };
+      const save = root.rotation.clone();
+
+      for(const c of candidates){
+        root.rotation.set(c.rx, 0, 0);
+        const bb = new THREE.Box3().setFromObject(root);
+        const size = bb.getSize(new THREE.Vector3());
+        const score = size.z; // on veut l'épaisseur Z minimale
+        if(score < best.score) best = { rx:c.rx, score };
+      }
+      root.rotation.copy(save);
+      root.rotation.set(best.rx, 0, 0);
+    }
+
     // ---------------- CHARGEMENT ----------------
     const loader=new GLTFLoader();
     const pieces=[];
-    let puzzleRoot=null;
-    let currentBBox=null;
+    let puzzleRoot=null, currentBBox=null;
 
     loader.load(MODEL_URL,(gltf)=>{
       puzzleRoot=gltf.scene;
       scene.add(puzzleRoot);
 
-      // Si besoin, remettre le puzzle “à plat” selon export Blender :
-      // puzzleRoot.rotation.x = -Math.PI / 2;
+      // Oriente automatiquement pour garantir une vue de face (pièces visibles)
+      orientFlatToXY(puzzleRoot);
 
       // Récup des pièces (groupes/meshes)
       const meshes=[];
@@ -124,7 +137,7 @@
       const uniq=[...new Set(meshes)];
       uniq.forEach(m=>pieces.push({mesh:m,target:computeTargetTransform(m),placed:false}));
 
-      // Cadrage de face + bbox globale
+      // Cadrage strictement de face + bbox globale
       currentBBox = computePuzzleBBox(pieces.map(p=>p.mesh));
       frameFrontView(currentBBox);
 
@@ -200,7 +213,6 @@
       return cur;
     }
 
-    // --- CORRIGÉ + Anti-conflit avec OrbitControls ---
     function pointerDown(e){
       const { clientX, clientY } = getPoint(e);
       setPointer(clientX, clientY);
@@ -217,8 +229,8 @@
         const entry     = pieces.find(p => p.mesh === rootMesh);
         if (entry) {
           dragging = entry;
-          dragStartPos = entry.mesh.position.clone();   // mémorise la position d’origine
-          controls.enabled = false;                     // évite conflit caméra pendant le drag
+          dragStartPos = entry.mesh.position.clone();
+          controls.enabled = false; // évite conflit caméra
           const world = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
           dragOffset.copy(dragging.mesh.position).sub(world);
         }
@@ -231,29 +243,24 @@
       const world = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
       world.add(dragOffset);
 
-      // Déplacement fluide
-      dragging.mesh.position.lerp(world, LERP_ALPHA_DRAG);
-
-      // Aimantation en continu
-      tryMagnet(dragging);
+      dragging.mesh.position.lerp(world, LERP_ALPHA_DRAG); // drag fluide
+      tryMagnet(dragging);                                  // aimantation continue
     }
 
     function pointerUp(){
       if (dragging) {
-        // Dernière tentative de snap
-        tryMagnet(dragging, true);
+        tryMagnet(dragging, true); // ultime snap
 
-        // Si non placée et trop proche d'une autre pièce -> on annule la pose (anti-chevauchement)
+        // Anti-chevauchement : si non placée et proche d'une autre, on annule
         if (!dragging.placed && overlapsAny(dragging)) {
           dragging.mesh.position.copy(dragStartPos);
         }
 
         dragging = null;
       }
-      controls.enabled = true; // réactive la caméra
+      controls.enabled = true;
     }
 
-    // Test de proximité/chevauchement (centres)
     function overlapsAny(entry){
       const pos = entry.mesh.position;
       for (const other of pieces){
@@ -310,9 +317,11 @@
       camera.aspect=window.innerWidth/window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth,window.innerHeight);
+      // recadre si on a déjà la bbox
+      if (currentBBox) frameFrontView(currentBBox);
     });
 
-    // Events souris/tactile
+    // Events
     renderer.domElement.addEventListener('pointerdown',pointerDown,{passive:false});
     window.addEventListener('pointermove', pointerMove,{passive:false});
     window.addEventListener('pointerup',   pointerUp,  {passive:false});
