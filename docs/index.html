@@ -14,7 +14,7 @@
     canvas{display:block;}
   </style>
 
-  <!-- Import map Three.js r160 -->
+  <!-- Three.js r160 -->
   <script type="importmap">
   {
     "imports": {
@@ -31,6 +31,7 @@
     <div class="badge" id="placedInfo">0 / 50 placées</div>
   </div>
 
+  <!-- Son optionnel -->
   <audio id="snapSound" src="click.wav" preload="auto"></audio>
 
   <script type="module">
@@ -43,23 +44,23 @@
     const ROWS=5, COLS=10;
     const PUZZLE_W=3.0, PUZZLE_H=4.0;
     const CELL_W=PUZZLE_W/COLS, CELL_H=PUZZLE_H/ROWS;
+
+    // Magnétisme
     const CAPTURE_RADIUS=0.18, SNAP_EPS_POS=0.002, SNAP_EPS_ROT=0.001;
     const LERP_ALPHA_DRAG=0.6, LERP_ALPHA_SNAP=0.35;
     const LOCK_PLACED=true;
 
-    // -------------- SCÈNE ----------------
+    // ---------------- SCÈNE ----------------
     const app=document.getElementById('app');
     const scene=new THREE.Scene();
     scene.background=new THREE.Color('#0d1117');
 
+    // Caméra : pile en FACE (axe +Z), vue libre ensuite
     const camera=new THREE.PerspectiveCamera(50,window.innerWidth/window.innerHeight,0.01,100);
     const PUZZLE_CENTER=new THREE.Vector3(0,0,0);
-
-    // Caméra inclinée de 15° vers le bas (rotation sur X)
-    const DISTANCE = 5.5; // distance de la caméra
-    const ANGLE_DEGREES = 15;
-    const ANGLE = THREE.MathUtils.degToRad(ANGLE_DEGREES);
-    camera.position.set(0, Math.sin(ANGLE) * DISTANCE, Math.cos(ANGLE) * DISTANCE);
+    const START_DISTANCE = 6.0; // Ajustable
+    camera.position.set(0, 0, START_DISTANCE);
+    camera.up.set(0,1,0);
     camera.lookAt(PUZZLE_CENTER);
 
     const renderer=new THREE.WebGLRenderer({antialias:true});
@@ -69,13 +70,10 @@
     app.appendChild(renderer.domElement);
 
     // Lumières
-    const hemi=new THREE.HemisphereLight(0xffffff,0x334466,0.7);
-    scene.add(hemi);
-    const dir=new THREE.DirectionalLight(0xffffff,0.8);
-    dir.position.set(2,3,4);
-    scene.add(dir);
+    scene.add(new THREE.HemisphereLight(0xffffff,0x334466,0.7));
+    const dir=new THREE.DirectionalLight(0xffffff,0.8); dir.position.set(2,3,4); scene.add(dir);
 
-    // Contrôles libres
+    // Contrôles : LIBRES (rotation/pan/zoom)
     const controls=new OrbitControls(camera,renderer.domElement);
     controls.enableDamping=true;
     controls.dampingFactor=0.08;
@@ -85,11 +83,11 @@
     controls.target.copy(PUZZLE_CENTER);
     controls.update();
 
-    // ---------------- OUTILS ----------------
+    // Outils
     const raycaster=new THREE.Raycaster();
     const pointer=new THREE.Vector2();
     const tmpV3=new THREE.Vector3();
-    const dragPlane=new THREE.Plane(new THREE.Vector3(0,0,1),0);
+    const dragPlane=new THREE.Plane(new THREE.Vector3(0,0,1),0); // plan Z=0
 
     function screenToWorldOnPlane(x,y,plane,out){
       const rect=renderer.domElement.getBoundingClientRect();
@@ -108,33 +106,51 @@
     loader.load(MODEL_URL,(gltf)=>{
       puzzleRoot=gltf.scene;
       scene.add(puzzleRoot);
+
+      // 👉 Si ton GLB est exporté “couché” (plan XZ), dé-commente :
+      // puzzleRoot.rotation.x = -Math.PI / 2;
+
+      // Récup des pièces
       const meshes=[];
-      puzzleRoot.traverse(o=>{if(o.isMesh)meshes.push(o);});
-      meshes.forEach(m=>pieces.push({mesh:m,target:computeTargetTransform(m),placed:false}));
+      puzzleRoot.traverse(o=>{ if(o.isMesh) meshes.push(o.parent?.isGroup ? o.parent : o); });
+      const uniq=[...new Set(meshes)];
+      uniq.forEach(m=>pieces.push({mesh:m,target:computeTargetTransform(m),placed:false}));
+
+      // Cadrage STRICTEMENT DE FACE (axe +Z)
       const bbox=computePuzzleBBox(pieces.map(p=>p.mesh));
       frameFrontView(bbox);
-      pieces.forEach(p=>p.target.position.z=0);
-      updatePlacedCounter();
-    });
 
-    function parseRowColFromName(name){
+      // Z cible = 0 (plan)
+      pieces.forEach(p=>p.target.position.z=0);
+
+      updatePlacedCounter();
+    }, undefined, (err)=>console.error('Erreur chargement GLB:', err));
+
+    function parseRowColFromName(name=''){
       const m=/r(\d+)_c(\d+)/i.exec(name);
       return m?{r:+m[1],c:+m[2]}:null;
     }
 
+    let fallbackIndexCounter=0;
     function computeTargetTransform(obj){
-      if(obj.userData&&obj.userData.home){
+      if(obj.userData && obj.userData.home){
         const {pos,quat}=obj.userData.home;
-        return{
+        return {
           position:new THREE.Vector3(pos.x,pos.y,pos.z),
           quaternion:new THREE.Quaternion(quat.x,quat.y,quat.z,quat.w)
         };
       }
       const rc=parseRowColFromName(obj.name);
-      const x0=-PUZZLE_W/2+CELL_W/2,y0=PUZZLE_H/2-CELL_H/2;
-      if(rc)
-        return{position:new THREE.Vector3(x0+rc.c*CELL_W,y0-rc.r*CELL_H,0),quaternion:new THREE.Quaternion()};
-      return{position:new THREE.Vector3(0,0,0),quaternion:new THREE.Quaternion()};
+      const x0=-PUZZLE_W/2+CELL_W/2, y0=PUZZLE_H/2-CELL_H/2;
+      if(rc){
+        return { position:new THREE.Vector3(x0+rc.c*CELL_W, y0-rc.r*CELL_H, 0),
+                 quaternion:new THREE.Quaternion() };
+      }
+      // fallback (rare)
+      const idx=(fallbackIndexCounter++ % (ROWS*COLS));
+      const r=Math.floor(idx/COLS), c=idx%COLS;
+      return { position:new THREE.Vector3(x0+c*CELL_W, y0-r*CELL_H, 0),
+               quaternion:new THREE.Quaternion() };
     }
 
     function computePuzzleBBox(meshes){
@@ -143,31 +159,51 @@
       return bbox;
     }
 
+    // 👉 Cadre la caméra pile en face du centre et ajuste la distance
     function frameFrontView(bbox){
-      const size=new THREE.Vector3();bbox.getSize(size);
+      const size=new THREE.Vector3(); bbox.getSize(size);
+      const center=bbox.getCenter(new THREE.Vector3());
       const maxDim=Math.max(size.x,size.y);
       const fov=THREE.MathUtils.degToRad(camera.fov);
-      const dist=(maxDim*0.6)/Math.tan(fov/2);
-      camera.lookAt(bbox.getCenter(new THREE.Vector3()));
-      controls.target.copy(bbox.getCenter(new THREE.Vector3()));
+      const dist=(maxDim*0.6)/Math.tan(fov/2); // marge ≈40%
+
+      camera.position.set(center.x, center.y, dist); // FACE (axe +Z)
+      camera.up.set(0,1,0);
+      camera.lookAt(center);
+      controls.target.copy(center);
       controls.update();
     }
 
-    // ------------- DRAG & MAGNÉTISME -------------
+    // ---------------- DRAG & MAGNÉTISME ----------------
     const placedInfo=document.getElementById('placedInfo');
     const audioEl=document.getElementById('snapSound');
+
     let dragging=null;
     const dragOffset=new THREE.Vector3();
+
+    function getPoint(e){ return e.touches?.[0] || e.changedTouches?.[0] || e; }
+    function setPointer(x,y){
+      const rect=renderer.domElement.getBoundingClientRect();
+      pointer.x=((x-rect.left)/rect.width)*2-1;
+      pointer.y=-((y-rect.top)/rect.height)*2+1;
+    }
+    function findPieceRoot(obj){
+      let cur=obj;
+      while(cur && !pieces.some(p=>p.mesh===cur)) cur=cur.parent;
+      return cur;
+    }
 
     function pointerDown(e){
       const {clientX,clientY}=getPoint(e);
       setPointer(clientX,clientY);
       raycaster.setFromCamera(pointer,camera);
+
       const hits=raycaster.intersectObjects(pieces.map(p=>p.mesh),true)
-        .filter(h=>!h.object.userData.locked);
+        .filter(h=>!(findPieceRoot(h.object)?.userData?.locked));
+
       if(hits.length){
-        const mesh=hits[0].object;
-        dragging=pieces.find(p=>p.mesh===mesh||p.mesh===mesh.parent);
+        const root=findPieceRoot(hits[0].object);
+        dragging=pieces.find(p=>p.mesh===root);
         if(dragging){
           const w=screenToWorldOnPlane(clientX,clientY,dragPlane,tmpV3);
           dragOffset.copy(dragging.mesh.position).sub(w);
@@ -175,70 +211,72 @@
       }
     }
     function pointerMove(e){
-      if(!dragging)return;
+      if(!dragging) return;
       const {clientX,clientY}=getPoint(e);
       const w=screenToWorldOnPlane(clientX,clientY,dragPlane,tmpV3);
       w.add(dragOffset);
-      dragging.mesh.position.lerp(w,LERP_ALPHA_DRAG);
+      dragging.mesh.position.lerp(w, LERP_ALPHA_DRAG); // drag fluide
       tryMagnet(dragging);
     }
     function pointerUp(){
-      if(dragging){tryMagnet(dragging,true);dragging=null;}
+      if(dragging){ tryMagnet(dragging,true); dragging=null; }
     }
-    function getPoint(e){return e.touches?.[0]||e.changedTouches?.[0]||e;}
-    function setPointer(x,y){
-      const rect=renderer.domElement.getBoundingClientRect();
-      pointer.x=((x-rect.left)/rect.width)*2-1;
-      pointer.y=-((y-rect.top)/rect.height)*2+1;
-    }
+
     function angleBetweenQuats(a,b){
       const dot=Math.abs(a.dot(b));
       return Math.acos(Math.min(1,Math.max(-1,2*dot*dot-1)));
     }
-    function tryMagnet(entry,final=false){
-      if(!entry||entry.placed)return;
-      const mesh=entry.mesh,tgt=entry.target;
+    function tryMagnet(entry, final=false){
+      if(!entry || entry.placed) return;
+      const mesh=entry.mesh, tgt=entry.target;
+
       const d=mesh.position.distanceTo(tgt.position);
-      if(d>CAPTURE_RADIUS)return;
-      mesh.position.lerp(tgt.position,LERP_ALPHA_SNAP);
-      const a=angleBetweenQuats(mesh.quaternion,tgt.quaternion);
-      if(a>SNAP_EPS_ROT)mesh.quaternion.slerp(tgt.quaternion,LERP_ALPHA_SNAP);
-      const close=d<SNAP_EPS_POS&&a<SNAP_EPS_ROT;
-      if(close||final){
-        if(mesh.position.distanceTo(tgt.position)<2*SNAP_EPS_POS&&angleBetweenQuats(mesh.quaternion,tgt.quaternion)<2*SNAP_EPS_ROT){
+      if(d>CAPTURE_RADIUS) return;
+
+      mesh.position.lerp(tgt.position, LERP_ALPHA_SNAP);
+      const a=angleBetweenQuats(mesh.quaternion, tgt.quaternion);
+      if(a>SNAP_EPS_ROT) mesh.quaternion.slerp(tgt.quaternion, LERP_ALPHA_SNAP);
+
+      const close = d<SNAP_EPS_POS && a<SNAP_EPS_ROT;
+      if(close || final){
+        if(mesh.position.distanceTo(tgt.position)<2*SNAP_EPS_POS &&
+           angleBetweenQuats(mesh.quaternion, tgt.quaternion)<2*SNAP_EPS_ROT){
           mesh.position.copy(tgt.position);
           mesh.quaternion.copy(tgt.quaternion);
           entry.placed=true;
-          if(LOCK_PLACED)mesh.userData.locked=true;
-          playSnap();updatePlacedCounter();
+          if(LOCK_PLACED) mesh.userData.locked=true;
+          playSnap(); updatePlacedCounter();
         }
       }
     }
+
     function playSnap(){
-      if(!audioEl)return;
-      try{audioEl.currentTime=0;audioEl.play().catch(()=>{});}catch{}
+      if(!audioEl) return;
+      try{ audioEl.currentTime=0; audioEl.play().catch(()=>{}); }catch{}
     }
     function updatePlacedCounter(){
       const n=pieces.filter(p=>p.placed).length;
-      placedInfo.textContent=`${n} / ${pieces.length||ROWS*COLS} placées`;
+      placedInfo.textContent=`${n} / ${pieces.length || (ROWS*COLS)} placées`;
     }
 
-    // -------------- RENDER LOOP --------------
-    function animate(){requestAnimationFrame(animate);controls.update();renderer.render(scene,camera);}
+    // ---------------- RENDER ----------------
+    function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene,camera); }
     animate();
 
-    window.addEventListener('resize',()=>{
+    // Resize
+    window.addEventListener('resize', ()=>{
       camera.aspect=window.innerWidth/window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth,window.innerHeight);
     });
 
-    renderer.domElement.addEventListener('pointerdown',pointerDown,{passive:false});
-    window.addEventListener('pointermove',pointerMove,{passive:false});
-    window.addEventListener('pointerup',pointerUp,{passive:false});
-    renderer.domElement.addEventListener('touchstart',pointerDown,{passive:false});
-    window.addEventListener('touchmove',pointerMove,{passive:false});
-    window.addEventListener('touchend',pointerUp,{passive:false});
+    // Events
+    renderer.domElement.addEventListener('pointerdown', pointerDown, {passive:false});
+    window.addEventListener('pointermove',  pointerMove, {passive:false});
+    window.addEventListener('pointerup',    pointerUp,   {passive:false});
+    renderer.domElement.addEventListener('touchstart', pointerDown, {passive:false});
+    window.addEventListener('touchmove',  pointerMove, {passive:false});
+    window.addEventListener('touchend',   pointerUp,   {passive:false});
   </script>
 </body>
 </html>
