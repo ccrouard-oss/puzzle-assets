@@ -5,22 +5,23 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
   <title>Puzzle 3D – Protect the Oceans</title>
   <style>
-    html, body { height: 100%; margin:0; background:#0d1117; color:#e6edf3; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-    #app { position: fixed; inset: 0; }
-    .hud{ position:fixed; left:12px; top:12px; z-index:5; background:rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.08);
-      padding:8px 10px; border-radius:10px; backdrop-filter: blur(6px); font-size:13px; line-height:1.35; }
-    .hud b{ color:#fff; }
-    .badge{ display:inline-block; padding:2px 6px; border-radius:6px; border:1px solid rgba(255,255,255,.1); }
-    .keys{ opacity:.8; font-size:12px; margin-top:4px }
-    canvas{ display:block; }
+    html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}
+    #app{position:fixed;inset:0;}
+    .hud{position:fixed;left:12px;top:12px;z-index:5;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);
+      padding:8px 10px;border-radius:10px;backdrop-filter:blur(6px);font-size:13px;line-height:1.35;}
+    .hud b{color:#fff;}
+    .badge{display:inline-block;padding:2px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.1);}
+    canvas{display:block;}
   </style>
 
-  <!-- Three.js r160 -->
+  <!-- Import map Three.js r160 -->
   <script type="importmap">
-  { "imports": {
+  {
+    "imports": {
       "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
       "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
-  } }
+    }
+  }
   </script>
 </head>
 <body>
@@ -28,10 +29,8 @@
   <div class="hud">
     <div><b>Puzzle 3D</b> – Protect the Oceans</div>
     <div class="badge" id="placedInfo">0 / 50 placées</div>
-    <div class="keys">Raccourcis : <b>O</b> Ortho/Persp • <b>F</b> Recadrer face</div>
   </div>
 
-  <!-- Son (facultatif) : mettez un fichier click.wav dans le même dossier -->
   <audio id="snapSound" src="click.wav" preload="auto"></audio>
 
   <script type="module">
@@ -39,328 +38,205 @@
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-    // ---------------------- CONFIG ----------------------
-    const MODEL_URL = 'puzzle_50_scattered.glb'; // dans /docs
-    const ROWS = 5, COLS = 10;
-    const PUZZLE_W = 3.0, PUZZLE_H = 4.0;
-    const CELL_W = PUZZLE_W / COLS, CELL_H = PUZZLE_H / ROWS;
+    // ---------------- CONFIG ----------------
+    const MODEL_URL = 'puzzle_50_scattered.glb';
+    const ROWS=5, COLS=10;
+    const PUZZLE_W=3.0, PUZZLE_H=4.0;
+    const CELL_W=PUZZLE_W/COLS, CELL_H=PUZZLE_H/ROWS;
+    const CAPTURE_RADIUS=0.18, SNAP_EPS_POS=0.002, SNAP_EPS_ROT=0.001;
+    const LERP_ALPHA_DRAG=0.6, LERP_ALPHA_SNAP=0.35;
+    const LOCK_PLACED=true;
+    const FRONT_DISTANCE=6.0;
 
-    // Magnétisme
-    const CAPTURE_RADIUS = 0.18;
-    const SNAP_EPS_POS = 0.002;
-    const SNAP_EPS_ROT = 0.001;
-    const LERP_ALPHA_DRAG = 0.6;
-    const LERP_ALPHA_SNAP = 0.35;
+    // -------------- SCÈNE ----------------
+    const app=document.getElementById('app');
+    const scene=new THREE.Scene();
+    scene.background=new THREE.Color('#0d1117');
 
-    const LOCK_PLACED = true;
+    const camera=new THREE.PerspectiveCamera(50,window.innerWidth/window.innerHeight,0.01,100);
+    const PUZZLE_CENTER=new THREE.Vector3(0,0,0);
+    camera.position.set(0,0,FRONT_DISTANCE);
+    camera.up.set(0,1,0);
+    camera.lookAt(PUZZLE_CENTER);
 
-    // ---------------------- SCÈNE ----------------------
-    const app = document.getElementById('app');
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color('#0d1117');
-
-    const renderer = new THREE.WebGLRenderer({ antialias:true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    const renderer=new THREE.WebGLRenderer({antialias:true});
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+    renderer.setSize(window.innerWidth,window.innerHeight);
+    renderer.outputColorSpace=THREE.SRGBColorSpace;
     app.appendChild(renderer.domElement);
 
-    // Lumière douce
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x334466, 0.7));
-    const dir = new THREE.DirectionalLight(0xffffff, 0.8); dir.position.set(2,3,4); scene.add(dir);
+    // Lumière
+    const hemi=new THREE.HemisphereLight(0xffffff,0x334466,0.7);
+    scene.add(hemi);
+    const dir=new THREE.DirectionalLight(0xffffff,0.8);
+    dir.position.set(2,3,4);
+    scene.add(dir);
 
-    // --- Caméras : Perspective + Orthographique
-    let perspCam = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 100);
-    perspCam.position.set(0, 0, 6);
+    // Contrôles caméra — vue libre
+    const controls=new OrbitControls(camera,renderer.domElement);
+    controls.enableDamping=true;
+    controls.dampingFactor=0.08;
+    controls.enableRotate=true; // rotation libre
+    controls.enablePan=true;    // déplacement latéral autorisé
+    controls.enableZoom=true;   // zoom autorisé
+    controls.target.copy(PUZZLE_CENTER);
+    controls.update();
 
-    let orthoCam = null;        // créé lors du cadrage
-    let useOrtho = true;        // on démarre en 2D face
-    let camera = perspCam;      // sera remplacée si Ortho
+    // ---------------- OUTILS ----------------
+    const raycaster=new THREE.Raycaster();
+    const pointer=new THREE.Vector2();
+    const tmpV3=new THREE.Vector3();
+    const dragPlane=new THREE.Plane(new THREE.Vector3(0,0,1),0);
 
-    const controls = new OrbitControls(perspCam, renderer.domElement);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.08;
-
-    // Plan de travail Z=0 pour le drag
-    const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1), 0);
-
-    // ---------------------- OUTILS ----------------------
-    const raycaster = new THREE.Raycaster();
-    const pointer = new THREE.Vector2();
-    const tmpV3 = new THREE.Vector3();
-
-    function screenToWorldOnPlane(clientX, clientY, plane, outVec3) {
-      const rect = renderer.domElement.getBoundingClientRect();
-      pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
-      pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
-      raycaster.setFromCamera(pointer, camera);
-      raycaster.ray.intersectPlane(plane, outVec3);
-      return outVec3;
+    function screenToWorldOnPlane(x,y,plane,out){
+      const rect=renderer.domElement.getBoundingClientRect();
+      pointer.x=((x-rect.left)/rect.width)*2-1;
+      pointer.y=-((y-rect.top)/rect.height)*2+1;
+      raycaster.setFromCamera(pointer,camera);
+      raycaster.ray.intersectPlane(plane,out);
+      return out;
     }
 
-    // ---------------------- CHARGEMENT & PIÈCES ----------------------
-    const loader = new GLTFLoader();
-    const pieces = []; // { mesh, target:{position, quaternion}, placed }
-    let puzzleRoot = null, currentBBox = null;
+    // ---------------- CHARGEMENT ----------------
+    const loader=new GLTFLoader();
+    const pieces=[];
+    let puzzleRoot=null;
 
-    loader.load(MODEL_URL, (gltf) => {
-      puzzleRoot = gltf.scene;
+    loader.load(MODEL_URL,(gltf)=>{
+      puzzleRoot=gltf.scene;
       scene.add(puzzleRoot);
-
-      // Collecte des pièces : groupes ou meshes
-      const meshes = [];
-      puzzleRoot.traverse(obj => { if (obj.isMesh) meshes.push(obj.parent?.isGroup ? obj.parent : obj); });
-      // Déduplique (au cas où un group ait plusieurs meshes)
-      const uniq = [...new Set(meshes)];
-
-      uniq.forEach(m => { pieces.push({ mesh:m, target: computeTargetTransform(m), placed:false }); });
-
-      currentBBox = computePuzzleBBox(pieces.map(p => p.mesh));
-
-      // Démarrage en orthographique plein face
-      frameFrontViewOrtho(currentBBox);
-
-      // Z cible = 0
-      pieces.forEach(p => p.target.position.z = 0);
-
+      const meshes=[];
+      puzzleRoot.traverse(o=>{if(o.isMesh)meshes.push(o);});
+      meshes.forEach(m=>pieces.push({mesh:m,target:computeTargetTransform(m),placed:false}));
+      const bbox=computePuzzleBBox(pieces.map(p=>p.mesh));
+      frameFrontView(bbox);
+      pieces.forEach(p=>p.target.position.z=0);
       updatePlacedCounter();
-    }, undefined, (err) => console.error('Erreur chargement GLB:', err));
+    });
 
-    function parseRowColFromName(name='') {
-      const m = /r(\d+)_c(\d+)/i.exec(name);
-      return m ? { r:+m[1], c:+m[2] } : null;
+    function parseRowColFromName(name){
+      const m=/r(\d+)_c(\d+)/i.exec(name);
+      return m?{r:+m[1],c:+m[2]}:null;
     }
 
-    let fallbackIndexCounter = 0;
-    function computeTargetTransform(obj) {
-      // A) userData.home (si exporté depuis Blender)
-      if (obj.userData && obj.userData.home) {
-        const { pos, quat } = obj.userData.home;
-        return {
-          position: new THREE.Vector3(pos.x, pos.y, pos.z),
-          quaternion: new THREE.Quaternion(quat.x, quat.y, quat.z, quat.w),
+    function computeTargetTransform(obj){
+      if(obj.userData&&obj.userData.home){
+        const {pos,quat}=obj.userData.home;
+        return{
+          position:new THREE.Vector3(pos.x,pos.y,pos.z),
+          quaternion:new THREE.Quaternion(quat.x,quat.y,quat.z,quat.w)
         };
       }
-      // B) Nom "piece_rX_cY"
-      const rc = parseRowColFromName(obj.name);
-      const x0 = -PUZZLE_W/2 + CELL_W/2, y0 = PUZZLE_H/2 - CELL_H/2;
-      if (rc) {
-        return {
-          position: new THREE.Vector3(x0 + rc.c*CELL_W, y0 - rc.r*CELL_H, 0),
-          quaternion: new THREE.Quaternion()
-        };
-      }
-      // C) Fallback : ordre arbitraire
-      const idx = (fallbackIndexCounter++ % (ROWS*COLS));
-      const r = Math.floor(idx/COLS), c = idx%COLS;
-      return {
-        position: new THREE.Vector3(x0 + c*CELL_W, y0 - r*CELL_H, 0),
-        quaternion: new THREE.Quaternion()
-      };
+      const rc=parseRowColFromName(obj.name);
+      const x0=-PUZZLE_W/2+CELL_W/2,y0=PUZZLE_H/2-CELL_H/2;
+      if(rc)
+        return{position:new THREE.Vector3(x0+rc.c*CELL_W,y0-rc.r*CELL_H,0),quaternion:new THREE.Quaternion()};
+      return{position:new THREE.Vector3(0,0,0),quaternion:new THREE.Quaternion()};
     }
 
-    function computePuzzleBBox(meshes) {
-      const bbox = new THREE.Box3();
-      meshes.forEach(m => bbox.expandByObject(m));
+    function computePuzzleBBox(meshes){
+      const bbox=new THREE.Box3();
+      meshes.forEach(m=>bbox.expandByObject(m));
       return bbox;
     }
 
-    // ---------------------- CADRAGE FACE ----------------------
-    function frameFrontViewPerspective(bbox, padding = 0.6) {
-      const center = bbox.getCenter(new THREE.Vector3());
-      const size   = bbox.getSize(new THREE.Vector3());
-      const maxDim = Math.max(size.x, size.y);
-      const fovRad = THREE.MathUtils.degToRad(perspCam.fov);
-      const dist   = (maxDim * (1 + padding)) / (2 * Math.tan(fovRad/2));
-
-      perspCam.position.set(center.x, center.y, dist);
-      perspCam.up.set(0,1,0);
-      perspCam.lookAt(center);
-
-      controls.object = perspCam;
-      controls.enableRotate = true;
-      controls.target.copy(center);
+    function frameFrontView(bbox){
+      const size=new THREE.Vector3();bbox.getSize(size);
+      const maxDim=Math.max(size.x,size.y);
+      const fov=THREE.MathUtils.degToRad(camera.fov);
+      const dist=(maxDim*0.6)/Math.tan(fov/2);
+      camera.position.set(0,0,dist);
+      camera.lookAt(bbox.getCenter(new THREE.Vector3()));
+      controls.target.copy(bbox.getCenter(new THREE.Vector3()));
       controls.update();
-
-      camera = perspCam;
-      renderer.render(scene, camera);
     }
 
-    function frameFrontViewOrtho(bbox, padding = 0.15) {
-      const center = bbox.getCenter(new THREE.Vector3());
-      const size   = bbox.getSize(new THREE.Vector3());
-      const width  = size.x * (1 + padding);
-      const height = size.y * (1 + padding);
+    // ------------- DRAG & MAGNÉTISME -------------
+    const placedInfo=document.getElementById('placedInfo');
+    const audioEl=document.getElementById('snapSound');
+    let dragging=null;
+    const dragOffset=new THREE.Vector3();
 
-      const aspect = window.innerWidth / window.innerHeight;
-      let halfW = width/2, halfH = height/2;
-      if (width/height > aspect) halfH = halfW / aspect; else halfW = halfH * aspect;
-
-      orthoCam = new THREE.OrthographicCamera(-halfW, halfW, halfH, -halfH, -10, 100);
-      orthoCam.position.set(center.x, center.y, 10);
-      orthoCam.up.set(0,1,0);
-      orthoCam.lookAt(center);
-      orthoCam.updateProjectionMatrix();
-
-      controls.object = orthoCam;
-      controls.enableRotate = false;        // vraie 2D
-      controls.target.copy(center);
-      controls.update();
-
-      camera = orthoCam;
-      renderer.render(scene, camera);
-    }
-
-    // ---------------------- DRAG & MAGNÉTISME ----------------------
-    const placedInfo = document.getElementById('placedInfo');
-    const audioEl = document.getElementById('snapSound');
-
-    let dragging = null;
-    let dragOffset = new THREE.Vector3();
-
-    function getPrimaryPoint(ev){
-      return ev.touches && ev.touches.length ? ev.touches[0] :
-             ev.changedTouches && ev.changedTouches.length ? ev.changedTouches[0] : ev;
-    }
-    function setPointerFromClient(clientX, clientY){
-      const rect = renderer.domElement.getBoundingClientRect();
-      pointer.x = ((clientX - rect.left)/rect.width)*2 - 1;
-      pointer.y = -((clientY - rect.top)/rect.height)*2 + 1;
-    }
-
-    function findPieceRoot(obj){
-      let cur = obj;
-      while (cur && !pieces.some(p => p.mesh === cur)) cur = cur.parent;
-      return cur;
-    }
-
-    function pointerDown(ev){
-      const { clientX, clientY } = getPrimaryPoint(ev);
-      setPointerFromClient(clientX, clientY);
-      raycaster.setFromCamera(pointer, camera);
-
-      const intersects = raycaster.intersectObjects(pieces.map(p=>p.mesh), true)
-        .filter(hit => {
-          const root = findPieceRoot(hit.object);
-          return root && !(root.userData && root.userData.locked);
-        });
-
-      if (intersects.length){
-        const root = findPieceRoot(intersects[0].object);
-        dragging = pieces.find(p => p.mesh === root);
-        if (dragging){
-          const world = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
-          dragOffset.copy(dragging.mesh.position).sub(world);
+    function pointerDown(e){
+      const {clientX,clientY}=getPoint(e);
+      setPointer(clientX,clientY);
+      raycaster.setFromCamera(pointer,camera);
+      const hits=raycaster.intersectObjects(pieces.map(p=>p.mesh),true)
+        .filter(h=>!h.object.userData.locked);
+      if(hits.length){
+        const mesh=hits[0].object;
+        dragging=pieces.find(p=>p.mesh===mesh||p.mesh===mesh.parent);
+        if(dragging){
+          const w=screenToWorldOnPlane(clientX,clientY,dragPlane,tmpV3);
+          dragOffset.copy(dragging.mesh.position).sub(w);
         }
       }
     }
-
-    function pointerMove(ev){
-      if (!dragging) return;
-      const { clientX, clientY } = getPrimaryPoint(ev);
-      const world = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
-      world.add(dragOffset);
-
-      dragging.mesh.position.lerp(world, LERP_ALPHA_DRAG); // drag fluide
+    function pointerMove(e){
+      if(!dragging)return;
+      const {clientX,clientY}=getPoint(e);
+      const w=screenToWorldOnPlane(clientX,clientY,dragPlane,tmpV3);
+      w.add(dragOffset);
+      dragging.mesh.position.lerp(w,LERP_ALPHA_DRAG);
       tryMagnet(dragging);
     }
-
     function pointerUp(){
-      if (dragging){
-        tryMagnet(dragging, true); // dernier essai
-        dragging = null;
-      }
+      if(dragging){tryMagnet(dragging,true);dragging=null;}
     }
-
-    function angleBetweenQuats(a, b){
-      const dot = Math.abs(a.dot(b));
-      return Math.acos(Math.min(1, Math.max(-1, 2*dot*dot - 1)));
+    function getPoint(e){return e.touches?.[0]||e.changedTouches?.[0]||e;}
+    function setPointer(x,y){
+      const rect=renderer.domElement.getBoundingClientRect();
+      pointer.x=((x-rect.left)/rect.width)*2-1;
+      pointer.y=-((y-rect.top)/rect.height)*2+1;
     }
-
-    function tryMagnet(entry, finalAttempt=false){
-      if (!entry || entry.placed) return;
-      const mesh = entry.mesh, tgt = entry.target;
-
-      const dPos = mesh.position.distanceTo(tgt.position);
-      if (dPos > CAPTURE_RADIUS) return;
-
-      mesh.position.lerp(tgt.position, LERP_ALPHA_SNAP);
-      const a = angleBetweenQuats(mesh.quaternion, tgt.quaternion);
-      if (a > SNAP_EPS_ROT) mesh.quaternion.slerp(tgt.quaternion, LERP_ALPHA_SNAP);
-
-      const closeEnough = dPos < SNAP_EPS_POS && a < SNAP_EPS_ROT;
-      if (closeEnough || finalAttempt){
-        if (mesh.position.distanceTo(tgt.position) < 2*SNAP_EPS_POS &&
-            angleBetweenQuats(mesh.quaternion, tgt.quaternion) < 2*SNAP_EPS_ROT){
+    function angleBetweenQuats(a,b){
+      const dot=Math.abs(a.dot(b));
+      return Math.acos(Math.min(1,Math.max(-1,2*dot*dot-1)));
+    }
+    function tryMagnet(entry,final=false){
+      if(!entry||entry.placed)return;
+      const mesh=entry.mesh,tgt=entry.target;
+      const d=mesh.position.distanceTo(tgt.position);
+      if(d>CAPTURE_RADIUS)return;
+      mesh.position.lerp(tgt.position,LERP_ALPHA_SNAP);
+      const a=angleBetweenQuats(mesh.quaternion,tgt.quaternion);
+      if(a>SNAP_EPS_ROT)mesh.quaternion.slerp(tgt.quaternion,LERP_ALPHA_SNAP);
+      const close=d<SNAP_EPS_POS&&a<SNAP_EPS_ROT;
+      if(close||final){
+        if(mesh.position.distanceTo(tgt.position)<2*SNAP_EPS_POS&&angleBetweenQuats(mesh.quaternion,tgt.quaternion)<2*SNAP_EPS_ROT){
           mesh.position.copy(tgt.position);
           mesh.quaternion.copy(tgt.quaternion);
-          mesh.position.set(
-            Math.round(mesh.position.x*1000)/1000,
-            Math.round(mesh.position.y*1000)/1000,
-            Math.round(mesh.position.z*1000)/1000
-          );
-          entry.placed = true;
-          if (LOCK_PLACED) mesh.userData.locked = true;
-          playSnap();
-          updatePlacedCounter();
+          entry.placed=true;
+          if(LOCK_PLACED)mesh.userData.locked=true;
+          playSnap();updatePlacedCounter();
         }
       }
     }
-
     function playSnap(){
-      if (!audioEl) return;
-      try{ audioEl.currentTime = 0; audioEl.play().catch(()=>{}); }catch{}
+      if(!audioEl)return;
+      try{audioEl.currentTime=0;audioEl.play().catch(()=>{});}catch{}
     }
-
     function updatePlacedCounter(){
-      const n = pieces.filter(p=>p.placed).length;
-      placedInfo.textContent = `${n} / ${pieces.length || (ROWS*COLS)} placées`;
+      const n=pieces.filter(p=>p.placed).length;
+      placedInfo.textContent=`${n} / ${pieces.length||ROWS*COLS} placées`;
     }
 
-    // ---------------------- RENDER LOOP ----------------------
-    function animate(){
-      requestAnimationFrame(animate);
-      controls.update();
-      renderer.render(scene, camera);
-    }
+    // -------------- RENDER LOOP --------------
+    function animate(){requestAnimationFrame(animate);controls.update();renderer.render(scene,camera);}
     animate();
 
-    // ---------------------- EVENTS ----------------------
-    window.addEventListener('resize', () => {
-      const w = window.innerWidth, h = window.innerHeight;
-      renderer.setSize(w, h);
-
-      if (perspCam){
-        perspCam.aspect = w / h;
-        perspCam.updateProjectionMatrix();
-      }
-      if (useOrtho && currentBBox){
-        // Recalcule proprement l'ortho au nouveau ratio
-        frameFrontViewOrtho(currentBBox);
-      }
+    window.addEventListener('resize',()=>{
+      camera.aspect=window.innerWidth/window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth,window.innerHeight);
     });
 
-    renderer.domElement.addEventListener('pointerdown', pointerDown, { passive:false });
-    window.addEventListener('pointermove', pointerMove, { passive:false });
-    window.addEventListener('pointerup',   pointerUp,   { passive:false });
-
-    renderer.domElement.addEventListener('touchstart', pointerDown, { passive:false });
-    window.addEventListener('touchmove',  pointerMove, { passive:false });
-    window.addEventListener('touchend',   pointerUp,   { passive:false });
-
-    // Raccourcis : O (Ortho/Persp), F (Frame face)
-    window.addEventListener('keydown', (e) => {
-      if (!currentBBox) return;
-      const k = e.key.toLowerCase();
-      if (k === 'o'){
-        useOrtho = !useOrtho;
-        if (useOrtho) frameFrontViewOrtho(currentBBox);
-        else          frameFrontViewPerspective(currentBBox);
-      } else if (k === 'f'){
-        if (useOrtho) frameFrontViewOrtho(currentBBox);
-        else          frameFrontViewPerspective(currentBBox);
-      }
-    });
+    renderer.domElement.addEventListener('pointerdown',pointerDown,{passive:false});
+    window.addEventListener('pointermove',pointerMove,{passive:false});
+    window.addEventListener('pointerup',pointerUp,{passive:false});
+    renderer.domElement.addEventListener('touchstart',pointerDown,{passive:false});
+    window.addEventListener('touchmove',pointerMove,{passive:false});
+    window.addEventListener('touchend',pointerUp,{passive:false});
   </script>
 </body>
 </html>
