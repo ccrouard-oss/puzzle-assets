@@ -46,7 +46,6 @@
     const CAPTURE_RADIUS=0.18, SNAP_EPS_POS=0.002, SNAP_EPS_ROT=0.001;
     const LERP_ALPHA_DRAG=0.6, LERP_ALPHA_SNAP=0.35;
     const LOCK_PLACED=true;
-    const FRONT_DISTANCE=6.0;
 
     // -------------- SCÈNE ----------------
     const app=document.getElementById('app');
@@ -55,8 +54,12 @@
 
     const camera=new THREE.PerspectiveCamera(50,window.innerWidth/window.innerHeight,0.01,100);
     const PUZZLE_CENTER=new THREE.Vector3(0,0,0);
-    camera.position.set(0,0,FRONT_DISTANCE);
-    camera.up.set(0,1,0);
+
+    // Caméra inclinée de 15° vers le bas (rotation sur X)
+    const DISTANCE = 5.5; // distance de la caméra
+    const ANGLE_DEGREES = 15;
+    const ANGLE = THREE.MathUtils.degToRad(ANGLE_DEGREES);
+    camera.position.set(0, Math.sin(ANGLE) * DISTANCE, Math.cos(ANGLE) * DISTANCE);
     camera.lookAt(PUZZLE_CENTER);
 
     const renderer=new THREE.WebGLRenderer({antialias:true});
@@ -65,20 +68,20 @@
     renderer.outputColorSpace=THREE.SRGBColorSpace;
     app.appendChild(renderer.domElement);
 
-    // Lumière
+    // Lumières
     const hemi=new THREE.HemisphereLight(0xffffff,0x334466,0.7);
     scene.add(hemi);
     const dir=new THREE.DirectionalLight(0xffffff,0.8);
     dir.position.set(2,3,4);
     scene.add(dir);
 
-    // Contrôles caméra — vue libre
+    // Contrôles libres
     const controls=new OrbitControls(camera,renderer.domElement);
     controls.enableDamping=true;
     controls.dampingFactor=0.08;
-    controls.enableRotate=true; // rotation libre
-    controls.enablePan=true;    // déplacement latéral autorisé
-    controls.enableZoom=true;   // zoom autorisé
+    controls.enableRotate=true;
+    controls.enablePan=true;
+    controls.enableZoom=true;
     controls.target.copy(PUZZLE_CENTER);
     controls.update();
 
@@ -145,7 +148,6 @@
       const maxDim=Math.max(size.x,size.y);
       const fov=THREE.MathUtils.degToRad(camera.fov);
       const dist=(maxDim*0.6)/Math.tan(fov/2);
-      camera.position.set(0,0,dist);
       camera.lookAt(bbox.getCenter(new THREE.Vector3()));
       controls.target.copy(bbox.getCenter(new THREE.Vector3()));
       controls.update();
