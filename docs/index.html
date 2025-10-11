@@ -8,9 +8,12 @@
     html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}
     #app{position:fixed;inset:0;}
     .hud{position:fixed;left:12px;top:12px;z-index:5;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);
-      padding:8px 10px;border-radius:10px;backdrop-filter:blur(6px);font-size:13px;line-height:1.35;}
+      padding:8px 10px;border-radius:10px;backdrop-filter:blur(6px);font-size:13px;line-height:1.35;display:flex;gap:10px;align-items:center}
     .hud b{color:#fff;}
     .badge{display:inline-block;padding:2px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.1);}
+    .btn{cursor:pointer;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#e6edf3;
+      padding:6px 10px;border-radius:8px;font-size:12px}
+    .btn:hover{background:rgba(255,255,255,.12)}
     canvas{display:block;}
   </style>
 
@@ -29,6 +32,7 @@
   <div class="hud">
     <div><b>Puzzle 3D</b> – Protect the Oceans</div>
     <div class="badge" id="placedInfo">0 / 50 placées</div>
+    <button id="faceBtn" class="btn" title="Recadrer face (touche F)">Face</button>
   </div>
 
   <!-- Son optionnel -->
@@ -50,6 +54,9 @@
     const LERP_ALPHA_DRAG=0.6, LERP_ALPHA_SNAP=0.35;
     const LOCK_PLACED=true;
 
+    // Anti-chevauchement (distance mini entre centres hors snap)
+    const MIN_CENTER_DIST = Math.min(CELL_W, CELL_H) * 0.18;
+
     // ---------------- SCÈNE ----------------
     const app=document.getElementById('app');
     const scene=new THREE.Scene();
@@ -58,7 +65,7 @@
     // Caméra : pile en FACE (axe +Z), vue libre ensuite
     const camera=new THREE.PerspectiveCamera(50,window.innerWidth/window.innerHeight,0.01,100);
     const PUZZLE_CENTER=new THREE.Vector3(0,0,0);
-    const START_DISTANCE = 6.0; // Ajustable
+    const START_DISTANCE = 6.0;
     camera.position.set(0, 0, START_DISTANCE);
     camera.up.set(0,1,0);
     camera.lookAt(PUZZLE_CENTER);
@@ -73,7 +80,7 @@
     scene.add(new THREE.HemisphereLight(0xffffff,0x334466,0.7));
     const dir=new THREE.DirectionalLight(0xffffff,0.8); dir.position.set(2,3,4); scene.add(dir);
 
-    // Contrôles : LIBRES (rotation/pan/zoom)
+    // Contrôles : LIBRES
     const controls=new OrbitControls(camera,renderer.domElement);
     controls.enableDamping=true;
     controls.dampingFactor=0.08;
@@ -102,27 +109,26 @@
     const loader=new GLTFLoader();
     const pieces=[];
     let puzzleRoot=null;
+    let currentBBox=null;
 
     loader.load(MODEL_URL,(gltf)=>{
       puzzleRoot=gltf.scene;
       scene.add(puzzleRoot);
 
-      // 👉 Si ton GLB est exporté “couché” (plan XZ), dé-commente :
-      puzzleRoot.rotation.x = -Math.PI / 2;
+      // Si besoin, remettre le puzzle “à plat” selon export Blender :
+      // puzzleRoot.rotation.x = -Math.PI / 2;
 
-      // Récup des pièces
+      // Récup des pièces (groupes/meshes)
       const meshes=[];
       puzzleRoot.traverse(o=>{ if(o.isMesh) meshes.push(o.parent?.isGroup ? o.parent : o); });
       const uniq=[...new Set(meshes)];
       uniq.forEach(m=>pieces.push({mesh:m,target:computeTargetTransform(m),placed:false}));
 
-      // Cadrage STRICTEMENT DE FACE (axe +Z)
-      const bbox=computePuzzleBBox(pieces.map(p=>p.mesh));
-      frameFrontView(bbox);
+      // Cadrage de face + bbox globale
+      currentBBox = computePuzzleBBox(pieces.map(p=>p.mesh));
+      frameFrontView(currentBBox);
 
-      // Z cible = 0 (plan)
       pieces.forEach(p=>p.target.position.z=0);
-
       updatePlacedCounter();
     }, undefined, (err)=>console.error('Erreur chargement GLB:', err));
 
@@ -146,7 +152,6 @@
         return { position:new THREE.Vector3(x0+rc.c*CELL_W, y0-rc.r*CELL_H, 0),
                  quaternion:new THREE.Quaternion() };
       }
-      // fallback (rare)
       const idx=(fallbackIndexCounter++ % (ROWS*COLS));
       const r=Math.floor(idx/COLS), c=idx%COLS;
       return { position:new THREE.Vector3(x0+c*CELL_W, y0-r*CELL_H, 0),
@@ -161,6 +166,7 @@
 
     // 👉 Cadre la caméra pile en face du centre et ajuste la distance
     function frameFrontView(bbox){
+      if(!bbox) return;
       const size=new THREE.Vector3(); bbox.getSize(size);
       const center=bbox.getCenter(new THREE.Vector3());
       const maxDim=Math.max(size.x,size.y);
@@ -179,6 +185,7 @@
     const audioEl=document.getElementById('snapSound');
 
     let dragging=null;
+    let dragStartPos=null;
     const dragOffset=new THREE.Vector3();
 
     function getPoint(e){ return e.touches?.[0] || e.changedTouches?.[0] || e; }
@@ -193,33 +200,68 @@
       return cur;
     }
 
+    // --- CORRIGÉ + Anti-conflit avec OrbitControls ---
     function pointerDown(e){
-      const {clientX,clientY}=getPoint(e);
-      setPointer(clientX,clientY);
-      raycaster.setFromCamera(pointer,camera);
+      const { clientX, clientY } = getPoint(e);
+      setPointer(clientX, clientY);
+      raycaster.setFromCamera(pointer, camera);
 
-      const hits=raycaster.intersectObjects(pieces.map(p=>p.mesh),true)
-        .filter(h=>!(findPieceRoot(h.object)?.userData?.locked));
+      const hits = raycaster.intersectObjects(pieces.map(p => p.mesh), true)
+        .filter(hit => {
+          const root = findPieceRoot(hit.object);
+          return root && !(root.userData && root.userData.locked);
+        });
 
-      if(hits.length){
-        const root=findPieceRoot(hits[0].object);
-        dragging=pieces.find(p=>p.mesh===root);
-        if(dragging){
-          const w=screenToWorldOnPlane(clientX,clientY,dragPlane,tmpV3);
-          dragOffset.copy(dragging.mesh.position).sub(w);
+      if (hits.length) {
+        const rootMesh  = findPieceRoot(hits[0].object);
+        const entry     = pieces.find(p => p.mesh === rootMesh);
+        if (entry) {
+          dragging = entry;
+          dragStartPos = entry.mesh.position.clone();   // mémorise la position d’origine
+          controls.enabled = false;                     // évite conflit caméra pendant le drag
+          const world = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
+          dragOffset.copy(dragging.mesh.position).sub(world);
         }
       }
     }
+
     function pointerMove(e){
-      if(!dragging) return;
-      const {clientX,clientY}=getPoint(e);
-      const w=screenToWorldOnPlane(clientX,clientY,dragPlane,tmpV3);
-      w.add(dragOffset);
-      dragging.mesh.position.lerp(w, LERP_ALPHA_DRAG); // drag fluide
+      if (!dragging) return;
+      const { clientX, clientY } = getPoint(e);
+      const world = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
+      world.add(dragOffset);
+
+      // Déplacement fluide
+      dragging.mesh.position.lerp(world, LERP_ALPHA_DRAG);
+
+      // Aimantation en continu
       tryMagnet(dragging);
     }
+
     function pointerUp(){
-      if(dragging){ tryMagnet(dragging,true); dragging=null; }
+      if (dragging) {
+        // Dernière tentative de snap
+        tryMagnet(dragging, true);
+
+        // Si non placée et trop proche d'une autre pièce -> on annule la pose (anti-chevauchement)
+        if (!dragging.placed && overlapsAny(dragging)) {
+          dragging.mesh.position.copy(dragStartPos);
+        }
+
+        dragging = null;
+      }
+      controls.enabled = true; // réactive la caméra
+    }
+
+    // Test de proximité/chevauchement (centres)
+    function overlapsAny(entry){
+      const pos = entry.mesh.position;
+      for (const other of pieces){
+        if (other === entry) continue;
+        const d = pos.distanceTo(other.mesh.position);
+        if (d < MIN_CENTER_DIST) return true;
+      }
+      return false;
     }
 
     function angleBetweenQuats(a,b){
@@ -270,13 +312,19 @@
       renderer.setSize(window.innerWidth,window.innerHeight);
     });
 
-    // Events
-    renderer.domElement.addEventListener('pointerdown', pointerDown, {passive:false});
-    window.addEventListener('pointermove',  pointerMove, {passive:false});
-    window.addEventListener('pointerup',    pointerUp,   {passive:false});
-    renderer.domElement.addEventListener('touchstart', pointerDown, {passive:false});
-    window.addEventListener('touchmove',  pointerMove, {passive:false});
-    window.addEventListener('touchend',   pointerUp,   {passive:false});
+    // Events souris/tactile
+    renderer.domElement.addEventListener('pointerdown',pointerDown,{passive:false});
+    window.addEventListener('pointermove', pointerMove,{passive:false});
+    window.addEventListener('pointerup',   pointerUp,  {passive:false});
+    renderer.domElement.addEventListener('touchstart',pointerDown,{passive:false});
+    window.addEventListener('touchmove',  pointerMove,{passive:false});
+    window.addEventListener('touchend',   pointerUp,  {passive:false});
+
+    // ---- Bouton “Face” + Raccourci clavier F ----
+    const faceBtn = document.getElementById('faceBtn');
+    faceBtn.addEventListener('click', ()=> frameFrontView(currentBBox));
+    window.addEventListener('keydown', (e)=>{ if(e.key.toLowerCase()==='f') frameFrontView(currentBBox); });
+
   </script>
 </body>
 </html>
