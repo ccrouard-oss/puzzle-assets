@@ -14,7 +14,7 @@
     .btn{cursor:pointer;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#e6edf3;
       padding:6px 10px;border-radius:8px;font-size:12px}
     .btn:hover{background:rgba(255,255,255,.12)}
-    canvas{display:block;}
+    canvas{display:block; touch-action:none;} /* important pour le tactile */
   </style>
 
   <!-- Three.js r160 -->
@@ -33,7 +33,6 @@
     <button id="faceBtn" class="btn" title="Recadrer face (touche F)">Face</button>
   </div>
 
-  <!-- Son optionnel -->
   <audio id="snapSound" src="click.wav" preload="auto"></audio>
 
   <script type="module">
@@ -60,10 +59,10 @@
     const scene=new THREE.Scene();
     scene.background=new THREE.Color('#0d1117');
 
-    // Caméra : pile en FACE (axe +Z), vue libre ensuite
+    // Caméra face (perspective)
     const camera=new THREE.PerspectiveCamera(50,window.innerWidth/window.innerHeight,0.01,100);
     const PUZZLE_CENTER=new THREE.Vector3(0,0,0);
-    camera.position.set(0, 0, 6.0);
+    camera.position.set(0,0,6.0);
     camera.up.set(0,1,0);
     camera.lookAt(PUZZLE_CENTER);
 
@@ -77,24 +76,20 @@
     scene.add(new THREE.HemisphereLight(0xffffff,0x334466,0.7));
     const dir=new THREE.DirectionalLight(0xffffff,0.8); dir.position.set(2,3,4); scene.add(dir);
 
-    // Contrôles : LIBRES
+    // Contrôles : libres
     const controls=new OrbitControls(camera,renderer.domElement);
-    controls.enableDamping=true;
-    controls.dampingFactor=0.08;
-    controls.enableRotate=true;
-    controls.enablePan=true;
-    controls.enableZoom=true;
-    controls.target.copy(PUZZLE_CENTER);
-    controls.update();
+    controls.enableDamping=true; controls.dampingFactor=0.08;
+    controls.enableRotate=true; controls.enablePan=true; controls.enableZoom=true;
+    controls.target.copy(PUZZLE_CENTER); controls.update();
 
-    // Outils
+    // Outils picking/drag
     const raycaster=new THREE.Raycaster();
     const pointer=new THREE.Vector2();
     const tmpV3=new THREE.Vector3();
 
-    // --- Drag plane dynamique + offset en LOCAL(parent) ---
-    let dragPlane = null;                         // créé à chaque pointerDown (aligné à l'écran)
-    const dragOffsetLocal = new THREE.Vector3();  // offset conservé en local(parent)
+    // Plan de drag dynamique + offset en LOCAL(parent)
+    let dragPlane=null;
+    const dragOffsetLocal=new THREE.Vector3();
 
     function screenToWorldOnPlane(clientX, clientY, plane, out){
       const rect=renderer.domElement.getBoundingClientRect();
@@ -104,70 +99,82 @@
       raycaster.ray.intersectPlane(plane,out);
       return out;
     }
-
-    // Plan de drag aligné à l'écran, passant par un point monde donné
-    function makeScreenDragPlane(camera, worldPoint) {
-      const n = camera.getWorldDirection(new THREE.Vector3());
+    function makeScreenDragPlane(cam, worldPoint){
+      const n=cam.getWorldDirection(new THREE.Vector3());
       return new THREE.Plane().setFromNormalAndCoplanarPoint(n, worldPoint);
     }
-    // Convertit un point monde en local du parent de l'objet
-    function worldToParentLocal(obj, worldPoint) {
-      const parent = obj.parent || scene;
+    function worldToParentLocal(obj, worldPoint){
+      const parent=obj.parent||scene;
       return parent.worldToLocal(worldPoint.clone());
     }
 
-    // --------- Orientation auto : “à plat de face” ----------
+    // Orientation auto “à plat de face”
     function orientFlatToXY(root){
-      const candidates = [{rx:0},{rx: Math.PI/2},{rx:-Math.PI/2}];
-      let best = { rx:0, score: Infinity };
-      const save = root.rotation.clone();
-
+      const candidates=[{rx:0},{rx:Math.PI/2},{rx:-Math.PI/2}];
+      let best={rx:0,score:Infinity};
+      const save=root.rotation.clone();
       for(const c of candidates){
-        root.rotation.set(c.rx, 0, 0);
-        const bb = new THREE.Box3().setFromObject(root);
-        const size = bb.getSize(new THREE.Vector3());
-        const score = size.z; // on veut l'épaisseur Z minimale
-        if(score < best.score) best = { rx:c.rx, score };
+        root.rotation.set(c.rx,0,0);
+        const bb=new THREE.Box3().setFromObject(root);
+        const size=bb.getSize(new THREE.Vector3());
+        const score=size.z;
+        if(score<best.score) best={rx:c.rx,score};
       }
       root.rotation.copy(save);
-      root.rotation.set(best.rx, 0, 0);
+      root.rotation.set(best.rx,0,0);
     }
 
     // ---------------- CHARGEMENT ----------------
     const loader=new GLTFLoader();
-    const pieces=[];
+    const pieces=[];          // { mesh: rootPiece, target:{position,quaternion}, placed }
     let puzzleRoot=null, currentBBox=null;
+    let pickableMeshes=[];    // tous les Meshs pour le raycast
 
     loader.load(MODEL_URL,(gltf)=>{
       puzzleRoot=gltf.scene;
       scene.add(puzzleRoot);
 
-      // Oriente automatiquement pour garantir une vue de face (pièces visibles)
       orientFlatToXY(puzzleRoot);
-
-      // Stabiliser le parent (meilleure précision pour conversions monde/local)
       puzzleRoot.updateMatrixWorld(true);
-      puzzleRoot.matrixAutoUpdate = false;
+      puzzleRoot.matrixAutoUpdate=false; // parent stable
 
-      // Récup des pièces (groupes/meshes)
-      const meshes=[];
-      puzzleRoot.traverse(o=>{ if(o.isMesh) meshes.push(o.parent?.isGroup ? o.parent : o); });
-      const uniq=[...new Set(meshes)];
-      uniq.forEach(m=>pieces.push({mesh:m,target:computeTargetTransform(m),placed:false}));
+      // 1) Collecte tous les Mesh (pour le picking)
+      pickableMeshes=[];
+      puzzleRoot.traverse(o=>{ if(o.isMesh) pickableMeshes.push(o); });
 
-      // Cadrage strictement de face + bbox globale
-      currentBBox = computePuzzleBBox(pieces.map(p=>p.mesh));
+      // 2) Déduit les pièces-racines : on remonte jusqu'au PREMIER enfant de puzzleRoot
+      const rootSet=new Set();
+      for(const m of pickableMeshes){
+        let node=m;
+        while(node.parent && node.parent!==puzzleRoot) node=node.parent;
+        rootSet.add(node);
+      }
+      const roots=[...rootSet];
+
+      // 3) Initialise les pièces
+      roots.forEach(root=>{
+        pieces.push({
+          mesh: root,
+          target: computeTargetTransform(root),
+          placed: false
+        });
+      });
+
+      // Cadrage face + bbox
+      currentBBox=computePuzzleBBox(pieces.map(p=>p.mesh));
       frameFrontView(currentBBox);
 
+      // Z cible = 0
       pieces.forEach(p=>p.target.position.z=0);
+
       updatePlacedCounter();
     }, undefined, (err)=>console.error('Erreur chargement GLB:', err));
 
+    // Grille/nommage
     function parseRowColFromName(name=''){
       const m=/r(\d+)_c(\d+)/i.exec(name);
       return m?{r:+m[1],c:+m[2]}:null;
     }
-
     let fallbackIndexCounter=0;
     function computeTargetTransform(obj){
       if(obj.userData && obj.userData.home){
@@ -189,22 +196,21 @@
                quaternion:new THREE.Quaternion() };
     }
 
+    // BBox & cadrage face
     function computePuzzleBBox(meshes){
       const bbox=new THREE.Box3();
       meshes.forEach(m=>bbox.expandByObject(m));
       return bbox;
     }
-
-    // 👉 Cadre la caméra pile en face du centre et ajuste la distance
     function frameFrontView(bbox){
       if(!bbox) return;
       const size=new THREE.Vector3(); bbox.getSize(size);
       const center=bbox.getCenter(new THREE.Vector3());
       const maxDim=Math.max(size.x,size.y);
       const fov=THREE.MathUtils.degToRad(camera.fov);
-      const dist=(maxDim*0.6)/Math.tan(fov/2); // marge ≈40%
+      const dist=(maxDim*0.6)/Math.tan(fov/2);
 
-      camera.position.set(center.x, center.y, dist); // FACE (axe +Z)
+      camera.position.set(center.x, center.y, dist);
       camera.up.set(0,1,0);
       camera.lookAt(center);
       controls.target.copy(center);
@@ -224,39 +230,42 @@
       pointer.x=((x-rect.left)/rect.width)*2-1;
       pointer.y=-((y-rect.top)/rect.height)*2+1;
     }
-    function findPieceRoot(obj){
-      let cur=obj;
-      while(cur && !pieces.some(p=>p.mesh===cur)) cur=cur.parent;
-      return cur;
+    function findRootPiece(obj){
+      // remonte jusqu'au premier enfant de puzzleRoot
+      let node=obj;
+      while(node.parent && node.parent!==puzzleRoot) node=node.parent;
+      return node;
     }
 
     function pointerDown(e){
+      e.preventDefault();
       const { clientX, clientY } = getPoint(e);
       setPointer(clientX, clientY);
       raycaster.setFromCamera(pointer, camera);
 
-      const hits = raycaster.intersectObjects(pieces.map(p => p.mesh), true)
+      // pick parmi TOUS les Meshes, puis remonte vers la pièce-racine
+      const hits = raycaster.intersectObjects(pickableMeshes, true)
         .filter(hit => {
-          const root = findPieceRoot(hit.object);
+          const root = findRootPiece(hit.object);
           return root && !(root.userData && root.userData.locked);
         });
 
       if (!hits.length) return;
 
-      const rootMesh  = findPieceRoot(hits[0].object);
+      const rootMesh  = findRootPiece(hits[0].object);
       const entry     = pieces.find(p => p.mesh === rootMesh);
       if (!entry) return;
 
       dragging = entry;
       dragStartPos = entry.mesh.position.clone();
-      controls.enabled = false; // éviter conflit caméra
+      controls.enabled = false;
 
       // plan de drag aligné à l'écran, passant par la position MONDE de la pièce
       const pieceWorld = new THREE.Vector3();
       entry.mesh.getWorldPosition(pieceWorld);
       dragPlane = makeScreenDragPlane(camera, pieceWorld);
 
-      // point monde sous le curseur → local(parent) + offset local
+      // point monde → local(parent) + offset local
       const worldHit = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
       const localHit = worldToParentLocal(entry.mesh, worldHit);
       dragOffsetLocal.copy(entry.mesh.position).sub(localHit);
@@ -264,24 +273,20 @@
 
     function pointerMove(e){
       if (!dragging) return;
+      e.preventDefault();
       const { clientX, clientY } = getPoint(e);
 
-      // Intersection monde sur le plan dynamique
       const worldHit = screenToWorldOnPlane(clientX, clientY, dragPlane, tmpV3);
-
-      // Conversion en local(parent) puis application (lerp)
       const localHit = worldToParentLocal(dragging.mesh, worldHit).add(dragOffsetLocal);
       dragging.mesh.position.lerp(localHit, LERP_ALPHA_DRAG);
 
-      // Aimantation en continu
       tryMagnet(dragging);
     }
 
-    function pointerUp(){
+    function pointerUp(e){
+      e.preventDefault();
       if (dragging) {
-        tryMagnet(dragging, true); // ultime snap
-
-        // Anti-chevauchement : si non placée et proche d'une autre, on annule
+        tryMagnet(dragging, true);
         if (!dragging.placed && overlapsAny(dragging)) {
           dragging.mesh.position.copy(dragStartPos);
         }
@@ -343,13 +348,13 @@
 
     // Resize
     window.addEventListener('resize', ()=>{
-      camera.aspect=window.innerWidth/window.innerHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth,window.innerHeight);
+      const w=window.innerWidth, h=window.innerHeight;
+      renderer.setSize(w,h);
+      camera.aspect=w/h; camera.updateProjectionMatrix();
       if (currentBBox) frameFrontView(currentBBox);
     });
 
-    // Events
+    // Events (souris/tactile)
     renderer.domElement.addEventListener('pointerdown',pointerDown,{passive:false});
     window.addEventListener('pointermove', pointerMove,{passive:false});
     window.addEventListener('pointerup',   pointerUp,  {passive:false});
@@ -357,11 +362,10 @@
     window.addEventListener('touchmove',  pointerMove,{passive:false});
     window.addEventListener('touchend',   pointerUp,  {passive:false});
 
-    // ---- Bouton “Face” + Raccourci clavier F ----
-    const faceBtn = document.getElementById('faceBtn');
+    // Bouton “Face” + touche F
+    const faceBtn=document.getElementById('faceBtn');
     faceBtn.addEventListener('click', ()=> frameFrontView(currentBBox));
-    window.addEventListener('keydown', (e)=>{ if(e.key.toLowerCase()==='f') frameFrontView(currentBBox); });
-
+    window.addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='f') frameFrontView(currentBBox); });
   </script>
 </body>
 </html>
