@@ -37,37 +37,39 @@ const ROWS=5, COLS=10, BOARD_W=3.0, BOARD_H=4.0;
 const SNAP_DIST=0.12, SNAP_MS=180, WIN_EPS=0.01;
 
 // --- scène ---
-const host=document.getElementById('app');
-const renderer=new THREE.WebGLRenderer({antialias:true});
+const host = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias:true });
 renderer.setPixelRatio(Math.min(2, window.devicePixelRatio||1));
-resize(); host.appendChild(renderer.domElement);
+host.appendChild(renderer.domElement);         // <-- on ajoute d'abord le canvas
 
-const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0f172a);
-const camera=new THREE.PerspectiveCamera(45, host.clientWidth/host.clientHeight, 0.01, 100);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0f172a);
+
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100); // aspect mis à jour dans resize()
 camera.position.set(0,0,6);
 
-const controls=new OrbitControls(camera, renderer.domElement);
-controls.enableDamping=true; controls.enablePan=false; controls.target.set(0,0,0);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.enablePan = false; controls.target.set(0,0,0);
 
 scene.add(new THREE.AmbientLight(0xffffff,0.9));
-const dir=new THREE.DirectionalLight(0xffffff,0.9); dir.position.set(1,1,2); scene.add(dir);
+const dir = new THREE.DirectionalLight(0xffffff,0.9); dir.position.set(1,1,2); scene.add(dir);
 
 // utilitaires
-const raycaster=new THREE.Raycaster(); const mouse=new THREE.Vector2();
-const dragPlane=new THREE.Plane(new THREE.Vector3(0,0,1),0); const hitPoint=new THREE.Vector3();
+const raycaster = new THREE.Raycaster(); const mouse = new THREE.Vector2();
+const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1),0); const hitPoint = new THREE.Vector3();
 function ndc(ev){const r=renderer.domElement.getBoundingClientRect(); mouse.x=((ev.clientX-r.left)/r.width)*2-1; mouse.y=-((ev.clientY-r.top)/r.height)*2+1;}
 function step(){return {dx:BOARD_W/COLS, dy:BOARD_H/ROWS};}
 function home(r,c){const s=step(); const x0=-BOARD_W/2+c*s.dx, y0=-BOARD_H/2+r*s.dy; return new THREE.Vector3(x0+s.dx*0.5, y0+s.dy*0.5, 0);}
 function rc(name){const m=name.match(/Piece_(\d+)_(\d+)/); return m?{r:+m[1],c:+m[2]}:{r:0,c:0};}
 
-// charge le GLB placé DANS /docs (même dossier que ce fichier)
-const loader=new GLTFLoader(); const pieces=[];
+// charge le GLB placé DANS /docs (même dossier)
+const loader = new GLTFLoader(); const pieces = [];
 loader.load('./puzzle_50_scattered.glb', (gltf)=>{
   scene.add(gltf.scene);
   gltf.scene.traverse(o=>{
     if(o.isMesh && /^Piece_\d+_\d+/.test(o.name)){
       const {r,c}=rc(o.name);
-      o.userData.r=r; o.userData.c=c; 
+      o.userData.r=r; o.userData.c=c;
       o.userData.home=home(r,c);
       o.userData.homeQuat=new THREE.Quaternion();
       pieces.push(o);
@@ -90,7 +92,16 @@ function onMove(ev){if(!dragging) return; ndc(ev); raycaster.ray.intersectPlane(
 function tweenTo(obj, target, ms){const a=obj.position.clone(); const t0=performance.now(); function step(now){const u=Math.min(1,(now-t0)/ms); obj.position.lerpVectors(a,target,1-(1-u)*(1-u)); if(u<1) requestAnimationFrame(step); else checkWin();} requestAnimationFrame(step);}
 function onUp(){if(!dragging) return; const d=dragging.position.distanceTo(dragging.userData.home); if(d<=SNAP_DIST){tweenTo(dragging, dragging.userData.home, SNAP_MS);} else { for(const p of pieces){ if(p===dragging) continue; const near=p.position.distanceTo(dragging.position)<=SNAP_DIST; const ok=p.position.distanceTo(p.userData.home)<=WIN_EPS; if(near&&ok){tweenTo(dragging, dragging.userData.home, SNAP_MS); break; } } } dragging.renderOrder=0; dragging=null;}
 function checkWin(){const ok=pieces.length>0 && pieces.every(p=>p.position.distanceTo(p.userData.home)<=WIN_EPS && Math.abs(1-p.quaternion.dot(p.userData.homeQuat))<1e-3); if(ok) document.getElementById('win').style.display='flex';}
-function resize(){const w=host.clientWidth,h=host.clientHeight; renderer.setSize(w,h); camera.aspect=w/h; camera.updateProjectionMatrix();}
+
+// resize après création de la caméra (fix de l’erreur)
+function resize(){
+  const w = host.clientWidth, h = host.clientHeight;
+  renderer.setSize(w,h);
+  camera.aspect = w/h;
+  camera.updateProjectionMatrix();
+}
+resize(); // <-- appelé ici, maintenant que camera existe
+
 (function loop(){requestAnimationFrame(loop); controls.update(); renderer.render(scene,camera);})();
 </script>
 </body>
