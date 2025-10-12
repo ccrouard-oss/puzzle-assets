@@ -2,19 +2,20 @@
 <html lang="fr">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-  <title>Puzzle 3D – Face-On (Orthographic, No Perspective)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Puzzle 3D — Face, à plat (Ortho)</title>
   <style>
     html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
     #app{position:fixed;inset:0}
     .hud{position:fixed;left:12px;top:12px;z-index:5;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);
-      padding:8px 10px;border-radius:10px;backdrop-filter:blur(6px);font-size:13px;line-height:1.35;display:flex;gap:10px;align-items:center}
+      padding:10px 12px;border-radius:12px;backdrop-filter:blur(6px);font-size:13px;display:flex;gap:10px;align-items:center}
     .btn{cursor:pointer;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#e6edf3;
       padding:6px 10px;border-radius:8px;font-size:12px}
     .btn:hover{background:rgba(255,255,255,.12)}
+    .row{display:flex;gap:8px;align-items:center}
+    input[type="range"]{width:180px}
     canvas{display:block; touch-action:none}
   </style>
-
   <script type="importmap">
   { "imports": {
       "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
@@ -25,8 +26,13 @@
 <body>
   <div id="app"></div>
   <div class="hud">
-    <div><b>Puzzle 3D</b> – Face-On</div>
-    <button id="faceBtn" class="btn" title="Recentrer de face (F)">Face</button>
+    <div class="row">
+      <button id="faceBtn" class="btn" title="Recentrer (F)">Face</button>
+      <button id="rotL" class="btn" title="Tourner -5° (←)">↺</button>
+      <button id="rotR" class="btn" title="Tourner +5° (→)">↻</button>
+      <label for="rot">Rotation</label>
+      <input id="rot" type="range" min="-180" max="180" step="1" value="0" />
+    </div>
   </div>
 
   <script type="module">
@@ -41,12 +47,10 @@
     const scene = new THREE.Scene();
     scene.background = new THREE.Color('#0d1117');
 
-    // === Caméra orthographique (pas de perspective) ===
-    const aspect = window.innerWidth / window.innerHeight;
-    let halfW = 1, halfH = halfW / aspect;
-    const camera = new THREE.OrthographicCamera(-halfW, halfW, halfH, -halfH, 0.01, 1000);
-    camera.position.set(0, 0, 10);
-    camera.up.set(0, 1, 0);
+    // Caméra orthographique — toujours face au puzzle (aucune perspective)
+    const camera = new THREE.OrthographicCamera(-1,1,1,-1,0.01,1000);
+    camera.position.set(0,0,10);
+    camera.up.set(0,1,0);
 
     const renderer = new THREE.WebGLRenderer({ antialias:true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -54,36 +58,60 @@
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     app.appendChild(renderer.domElement);
 
-    // Éclairage doux
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x334466, 0.8));
-    const dir = new THREE.DirectionalLight(0xffffff, 0.6); dir.position.set(2,3,4); scene.add(dir);
+    // Lumière douce
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x334466, 0.9));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.5); dir.position.set(2,3,4); scene.add(dir);
 
-    // Contrôles: rotation désactivée (vue toujours à plat), pan+zoom OK
+    // Contrôles: pas de rotation de caméra (reste face), pan+zoom OK
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-    controls.enableRotate = false; // << pas de rotation
+    controls.enableRotate = false;
     controls.enablePan = true;
     controls.enableZoom = true;
 
     const loader = new GLTFLoader();
     let puzzleRoot = null;
-    let pickableMeshes = [];
-    let currentBBox = null;
+    let pickable = [];
+    let bbox = null;
 
-    // Calcule la boîte englobante
     function computeBBox(objs){
       const b = new THREE.Box3();
       objs.forEach(o => b.expandByObject(o));
       return b;
     }
 
-    // Vérifie si la face « visible » pointe bien vers la caméra (sinon on retourne le modèle)
+    // Cadrage orthographique de face
+    function frameFront(b){
+      if(!b) return;
+      const size = new THREE.Vector3(); b.getSize(size);
+      const center = b.getCenter(new THREE.Vector3());
+      const pad = 1.10; // 10% de marge
+      const needW = size.x * pad, needH = size.y * pad;
+      const a = window.innerWidth / window.innerHeight;
+      let viewW, viewH;
+      if (needW / needH > a) {
+        viewW = needW / 2;
+        viewH = (needW / a) / 2;
+      } else {
+        viewH = needH / 2;
+        viewW = (needH * a) / 2;
+      }
+      camera.left = -viewW; camera.right = viewW;
+      camera.top = viewH; camera.bottom = -viewH;
+      camera.position.set(center.x, center.y, 10);
+      camera.lookAt(center);
+      camera.updateProjectionMatrix();
+      controls.target.copy(center);
+      controls.update();
+    }
+
+    // Si le modèle est vu par l’arrière, on le retourne
     const raycaster = new THREE.Raycaster();
-    function frontIsVisible(meshes){
+    function isFrontVisible(meshes){
       if(!meshes.length) return true;
-      const bbox = computeBBox(meshes);
-      const center = bbox.getCenter(new THREE.Vector3());
-      const dir = new THREE.Vector3().subVectors(center, camera.position).normalize();
+      const b = computeBBox(meshes);
+      const c = b.getCenter(new THREE.Vector3());
+      const dir = new THREE.Vector3().subVectors(c, camera.position).normalize();
       raycaster.set(camera.position.clone(), dir);
       const hits = raycaster.intersectObjects(meshes, true);
       if(!hits.length) return true;
@@ -95,102 +123,75 @@
       return normalWorld.dot(surfaceToCamera) > 0;
     }
 
-    // Cadre une vue orthographique de face (sans perspective)
-    function frameFrontOrtho(bbox){
-      if(!bbox) return;
-      const size = new THREE.Vector3(); bbox.getSize(size);
-      const center = bbox.getCenter(new THREE.Vector3());
-
-      // marge pour respirer à l’écran
-      const pad = 1.10; // 10% de marge
-      const needW = size.x * pad;
-      const needH = size.y * pad;
-
-      const a = window.innerWidth / window.innerHeight;
-      let viewW, viewH;
-      if (needW / needH > a) {
-        // limité par la largeur de l’écran
-        viewW = needW / 2;
-        viewH = (needW / a) / 2;
-      } else {
-        // limité par la hauteur
-        viewH = needH / 2;
-        viewW = (needH * a) / 2;
-      }
-      camera.left = -viewW;
-      camera.right = viewW;
-      camera.top = viewH;
-      camera.bottom = -viewH;
-      camera.position.set(center.x, center.y, 10); // z positif (devant)
-      camera.lookAt(center);
-      camera.updateProjectionMatrix();
-
-      controls.target.copy(center);
-      controls.update();
-    }
-
-    // Réajuste la vue à la taille de la fenêtre
-    function handleResize(){
-      const a = window.innerWidth / window.innerHeight;
-      // On garde la même logique de cadrage (recalcule via bbox si dispo)
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      if(currentBBox) frameFrontOrtho(currentBBox);
-      else {
-        // fallback frustum raisonnable
-        const base = 1;
-        camera.left = -base*a;
-        camera.right = base*a;
-        camera.top = base;
-        camera.bottom = -base;
-        camera.updateProjectionMatrix();
-      }
-    }
-    window.addEventListener('resize', handleResize);
-
-    loader.load(MODEL_URL, (gltf) => {
+    loader.load(MODEL_URL, (gltf)=>{
       puzzleRoot = gltf.scene;
       puzzleRoot.rotation.set(0,0,0);
       puzzleRoot.updateMatrixWorld(true);
       scene.add(puzzleRoot);
 
-      // Récupère toutes les meshes cliquables, force l’affichage uniquement des faces avant
-      pickableMeshes = [];
+      pickable = [];
       puzzleRoot.traverse(o=>{
         if(o.isMesh){
-          pickableMeshes.push(o);
+          pickable.push(o);
           const mats = Array.isArray(o.material) ? o.material : [o.material];
-          for(const m of mats){
-            if(m && m.side !== THREE.FrontSide) m.side = THREE.FrontSide;
-          }
+          for(const m of mats){ if(m && m.side !== THREE.FrontSide) m.side = THREE.FrontSide; }
         }
       });
 
-      // Boîte + cadrage initial
-      currentBBox = computeBBox(pickableMeshes);
-      frameFrontOrtho(currentBBox);
+      bbox = computeBBox(pickable);
+      frameFront(bbox);
 
-      // Si on regarde l’envers, retourne le modèle (X puis Y si nécessaire)
-      if(!frontIsVisible(pickableMeshes)){
+      // Auto-flip si nécessaire
+      if(!isFrontVisible(pickable)){
         puzzleRoot.rotateX(Math.PI);
         puzzleRoot.updateMatrixWorld(true);
-        if(!frontIsVisible(pickableMeshes)){
+        if(!isFrontVisible(pickable)){
           puzzleRoot.rotateX(-Math.PI);
           puzzleRoot.rotateY(Math.PI);
           puzzleRoot.updateMatrixWorld(true);
         }
-        // recadre après flip
-        currentBBox = computeBBox(pickableMeshes);
-        frameFrontOrtho(currentBBox);
+        bbox = computeBBox(pickable);
+        frameFront(bbox);
       }
-    }, undefined, (err)=>{
-      console.error('Erreur chargement GLB:', err);
+    }, undefined, (e)=> console.error('Erreur GLB:', e));
+
+    // UI rotation in-plane (Z)
+    const rotSlider = document.getElementById('rot');
+    const rotL = document.getElementById('rotL');
+    const rotR = document.getElementById('rotR');
+    const faceBtn = document.getElementById('faceBtn');
+
+    function setRotationDeg(d){
+      if(!puzzleRoot) return;
+      const rad = THREE.MathUtils.degToRad(d);
+      // On ne touche qu’à Z pour rester à plat
+      puzzleRoot.rotation.set(0,0,rad);
+      puzzleRoot.updateMatrixWorld(true);
+      // recadre légèrement (bbox ne change pas avec pure rotZ, mais on recentre)
+      frameFront(bbox);
+    }
+
+    rotSlider.addEventListener('input', e => setRotationDeg(parseFloat(e.target.value)));
+    rotL.addEventListener('click', ()=>{ rotSlider.value = (+rotSlider.value - 5).toString(); setRotationDeg(+rotSlider.value); });
+    rotR.addEventListener('click', ()=>{ rotSlider.value = (+rotSlider.value + 5).toString(); setRotationDeg(+rotSlider.value); });
+    faceBtn.addEventListener('click', ()=>{ rotSlider.value = "0"; setRotationDeg(0); });
+
+    // Raccourcis
+    window.addEventListener('keydown', (e)=>{
+      const k = e.key.toLowerCase();
+      if(k==='f'){ rotSlider.value="0"; setRotationDeg(0); }
+      if(k==='arrowleft'){ rotSlider.value = (+rotSlider.value - 5).toString(); setRotationDeg(+rotSlider.value); }
+      if(k==='arrowright'){ rotSlider.value = (+rotSlider.value + 5).toString(); setRotationDeg(+rotSlider.value); }
     });
 
-    // Recentrage « Face » manuel
-    document.getElementById('faceBtn').addEventListener('click', ()=> frameFrontOrtho(currentBBox));
-    window.addEventListener('keydown', e => { if(e.key.toLowerCase()==='f') frameFrontOrtho(currentBBox); });
+    // Resize
+    function onResize(){
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      if(bbox) frameFront(bbox);
+    }
+    window.addEventListener('resize', onResize);
 
-    // Boucle
+    // Render loop
     (function animate(){
       requestAnimationFrame(animate);
       controls.update();
