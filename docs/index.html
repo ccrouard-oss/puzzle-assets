@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-  <title>Puzzle 3D – Protect the Oceans (GitHub Face-On)</title>
+  <title>Puzzle 3D – Protect the Oceans (Face-On Robust)</title>
   <style>
     html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}
     #app{position:fixed;inset:0;}
@@ -53,8 +53,7 @@
     scene.background=new THREE.Color('#0d1117');
 
     const camera=new THREE.PerspectiveCamera(50,window.innerWidth/window.innerHeight,0.01,100);
-    const PUZZLE_CENTER=new THREE.Vector3(0,0,0);
-    camera.position.set(0,0,6.0); camera.up.set(0,1,0); camera.lookAt(PUZZLE_CENTER);
+    camera.position.set(0,0,6.0); camera.up.set(0,1,0);
 
     const renderer=new THREE.WebGLRenderer({antialias:true});
     renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
@@ -68,9 +67,7 @@
     const controls=new OrbitControls(camera,renderer.domElement);
     controls.enableDamping=true; controls.dampingFactor=0.08;
     controls.enableRotate=true; controls.enablePan=true; controls.enableZoom=true;
-    controls.target.copy(PUZZLE_CENTER); controls.update();
 
-    // Picking & helpers
     const raycaster=new THREE.Raycaster();
     const pointer=new THREE.Vector2();
     const tmpV3=new THREE.Vector3();
@@ -94,48 +91,6 @@
       return parent.worldToLocal(worldPoint.clone());
     }
 
-    // Orientation: mise à plat (minimise Z thickness)
-    function orientFlatToXY(root){
-      const candidates=[{rx:0},{rx:Math.PI/2},{rx:-Math.PI/2}];
-      let best={rx:0,score:Infinity};
-      const save=root.rotation.clone();
-      for(const c of candidates){
-        root.rotation.set(c.rx,0,0);
-        const bb=new THREE.Box3().setFromObject(root);
-        const size=bb.getSize(new THREE.Vector3());
-        const score=size.z;
-        if(score<best.score) best={rx:c.rx,score};
-      }
-      root.rotation.copy(save);
-      root.rotation.set(best.rx,0,0);
-    }
-
-    // Ensure we're seeing the front face: raycast to center, test face normal vs camera direction
-    function ensureFrontFacing(puzzleRoot, pickable){
-      // Build bbox & center
-      const bbox=new THREE.Box3();
-      pickable.forEach(m=>bbox.expandByObject(m));
-      const center=bbox.getCenter(new THREE.Vector3());
-      // Ray from camera to center
-      const dir=new THREE.Vector3().subVectors(center, camera.position).normalize();
-      raycaster.set(camera.position.clone(), dir);
-      const hits=raycaster.intersectObjects(pickable, true);
-      if(!hits.length) return;
-      const hit=hits[0];
-      // Compute world-space normal of the hit face
-      const normalLocal = hit.face?.normal?.clone() || new THREE.Vector3(0,0,1);
-      const normalMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
-      const normalWorld = normalLocal.applyMatrix3(normalMatrix).normalize();
-      // Camera-to-surface vector
-      const camToSurface = new THREE.Vector3().subVectors(hit.point, camera.position).normalize().negate(); // from surface to camera
-      const dot = normalWorld.dot(camToSurface);
-      // If normal points away from the camera (dot < 0), flip around Y to show front
-      if(dot < 0){
-        puzzleRoot.rotateY(Math.PI);
-        puzzleRoot.updateMatrixWorld(true);
-      }
-    }
-
     function computePuzzleBBox(meshes){
       const bbox=new THREE.Box3();
       meshes.forEach(m=>bbox.expandByObject(m));
@@ -149,10 +104,27 @@
       const fov=THREE.MathUtils.degToRad(camera.fov);
       const dist=(maxDim*0.6)/Math.tan(fov/2);
       camera.position.set(center.x, center.y, dist);
-      camera.up.set(0,1,0);
       camera.lookAt(center);
       controls.target.copy(center);
       controls.update();
+    }
+
+    // Check if front is visible using face normal vs camera direction
+    function frontIsVisible(pickable){
+      if(!pickable.length) return true;
+      const bbox = computePuzzleBBox(pickable);
+      const center = bbox.getCenter(new THREE.Vector3());
+      const dir = new THREE.Vector3().subVectors(center, camera.position).normalize();
+      raycaster.set(camera.position.clone(), dir);
+      const hits = raycaster.intersectObjects(pickable, true);
+      if(!hits.length) return true;
+      const hit = hits[0];
+      const normalLocal = hit.face?.normal?.clone() || new THREE.Vector3(0,0,1);
+      const normalMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
+      const normalWorld = normalLocal.applyMatrix3(normalMatrix).normalize();
+      const surfaceToCamera = new THREE.Vector3().subVectors(camera.position, hit.point).normalize();
+      const dot = normalWorld.dot(surfaceToCamera);
+      return dot > 0; // front if normal points towards camera
     }
 
     const loader=new GLTFLoader();
@@ -162,21 +134,45 @@
 
     loader.load(MODEL_URL,(gltf)=>{
       puzzleRoot=gltf.scene;
-      scene.add(puzzleRoot);
-
-      // 1) flat & face
-      orientFlatToXY(puzzleRoot);
+      // reset any baked rotation/scales that could invert normals
+      puzzleRoot.rotation.set(0,0,0);
       puzzleRoot.updateMatrixWorld(true);
 
-      // 2) pickable meshes
-      pickableMeshes=[];
-      puzzleRoot.traverse(o=>{ if(o.isMesh) pickableMeshes.push(o); });
+      scene.add(puzzleRoot);
 
-      // 3) ensure front-facing by checking hit face normal
-      ensureFrontFacing(puzzleRoot, pickableMeshes);
+      // collect pickable meshes & enforce FrontSide (avoid seeing backfaces)
+      pickableMeshes=[];
+      puzzleRoot.traverse(o=>{
+        if(o.isMesh){
+          pickableMeshes.push(o);
+          if(o.material){
+            const mats = Array.isArray(o.material) ? o.material : [o.material];
+            for(const m of mats){
+              if(m && m.side !== THREE.FrontSide) m.side = THREE.FrontSide;
+            }
+          }
+        }
+      });
+
+      // Fit camera to object (before any flip)
+      currentBBox=computePuzzleBBox(pickableMeshes);
+      frameFrontView(currentBBox);
+
+      // Ensure face-on: try X flip first (seen from behind vertically), then Y flip as fallback
+      if(!frontIsVisible(pickableMeshes)){
+        puzzleRoot.rotateX(Math.PI);
+        puzzleRoot.updateMatrixWorld(true);
+        if(!frontIsVisible(pickableMeshes)){
+          puzzleRoot.rotateX(-Math.PI); // revert X
+          puzzleRoot.rotateY(Math.PI);  // try Y
+          puzzleRoot.updateMatrixWorld(true);
+        }
+      }
+
+      // Freeze transforms for stability
       puzzleRoot.matrixAutoUpdate=false;
 
-      // 4) root pieces (first level under puzzleRoot)
+      // Build root pieces (first level under root)
       const rootSet=new Set();
       for(const m of pickableMeshes){
         let node=m; while(node.parent && node.parent!==puzzleRoot) node=node.parent;
@@ -184,7 +180,7 @@
       }
       const roots=[...rootSet];
 
-      // 5) targets
+      // Targets (grid)
       let fallbackIndexCounter=0;
       const x0=-PUZZLE_W/2+CELL_W/2, y0=PUZZLE_H/2-CELL_H/2;
       function parseRowColFromName(name=''){
@@ -192,11 +188,6 @@
         return m?{r:+m[1],c:+m[2]}:null;
       }
       function computeTargetTransform(obj){
-        if(obj.userData && obj.userData.home){
-          const {pos,quat}=obj.userData.home;
-          return { position:new THREE.Vector3(pos.x,pos.y,pos.z),
-                   quaternion:new THREE.Quaternion(quat.x,quat.y,quat.z,quat.w) };
-        }
         const rc=parseRowColFromName(obj.name);
         if(rc){
           return { position:new THREE.Vector3(x0+rc.c*CELL_W, y0-rc.r*CELL_H, 0),
@@ -207,12 +198,12 @@
         return { position:new THREE.Vector3(x0+c*CELL_W, y0-r*CELL_H, 0),
                  quaternion:new THREE.Quaternion() };
       }
-
       roots.forEach(root=>{
         pieces.push({ mesh:root, target:computeTargetTransform(root), placed:false });
       });
 
-      currentBBox=computePuzzleBBox(pieces.map(p=>p.mesh));
+      // Reframe (after flip) and finalize
+      currentBBox=computePuzzleBBox(pickableMeshes);
       frameFrontView(currentBBox);
       pieces.forEach(p=>p.target.position.z=0);
       updatePlacedCounter();
