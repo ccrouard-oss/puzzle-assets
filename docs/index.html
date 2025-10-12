@@ -108,8 +108,16 @@
       return parent.worldToLocal(worldPoint.clone());
     }
 
+    // Helpers URL
+    function getParamBool(name){
+      const v=new URLSearchParams(location.search).get(name);
+      if(!v) return false;
+      return ['1','true','yes','on'].includes(v.toLowerCase());
+    }
+
     // Orientation auto “à plat de face”
     function orientFlatToXY(root){
+      // essaie plusieurs rotations X pour minimiser l'épaisseur Z
       const candidates=[{rx:0},{rx:Math.PI/2},{rx:-Math.PI/2}];
       let best={rx:0,score:Infinity};
       const save=root.rotation.clone();
@@ -134,15 +142,23 @@
       puzzleRoot=gltf.scene;
       scene.add(puzzleRoot);
 
+      // 1) Mise à plat/face
       orientFlatToXY(puzzleRoot);
-      // puzzleRoot.updateMatrixWorld(true);
-      puzzleRoot.matrixAutoUpdate=false; // parent stable
 
-      // 1) Collecte tous les Mesh (pour le picking)
+      // 2) Option d'inversion (flip) via URL ?flip=1 — rotation 180° autour de Z
+      if(getParamBool('flip')){
+        puzzleRoot.rotation.z += Math.PI;
+      }
+
+      // Appliquer maintenant et garder la hiérarchie stable
+      puzzleRoot.updateMatrixWorld(true);
+      puzzleRoot.matrixAutoUpdate=false;
+
+      // 3) Collecte tous les Mesh (pour le picking)
       pickableMeshes=[];
       puzzleRoot.traverse(o=>{ if(o.isMesh) pickableMeshes.push(o); });
 
-      // 2) Déduit les pièces-racines : on remonte jusqu'au PREMIER enfant de puzzleRoot
+      // 4) Déduit les pièces-racines : on remonte jusqu'au PREMIER enfant de puzzleRoot
       const rootSet=new Set();
       for(const m of pickableMeshes){
         let node=m;
@@ -151,7 +167,7 @@
       }
       const roots=[...rootSet];
 
-      // 3) Initialise les pièces
+      // 5) Initialise les pièces
       roots.forEach(root=>{
         pieces.push({
           mesh: root,
@@ -172,7 +188,7 @@
 
     // Grille/nommage
     function parseRowColFromName(name=''){
-      const m=/r(\d+)_c(\d+)/i.exec(name);
+      const m=/r(\\d+)_c(\\d+)/i.exec(name);
       return m?{r:+m[1],c:+m[2]}:null;
     }
     let fallbackIndexCounter=0;
