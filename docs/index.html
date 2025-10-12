@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-  <title>Puzzle 3D – Protect the Oceans (drag lent + magnétisme fiable)</title>
+  <title>Puzzle 3D – Planar + Hard-Lock</title>
   <style>
     html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}
     #app{position:fixed;inset:0;}
@@ -38,23 +38,25 @@
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-    /* ======== CONFIG ======== */
-    const MODEL_URL='puzzle_50_scattered.glb'; // même dossier
+    /* ===== CONFIG ===== */
+    const MODEL_URL='puzzle_50_scattered.glb';
     const ROWS=5, COLS=10;
-    const PUZZLE_W=3.0, PUZZLE_H=4.0; // portrait 4:3
+    const PUZZLE_W=3.0, PUZZLE_H=4.0;
     const CELL_W=PUZZLE_W/COLS, CELL_H=PUZZLE_H/ROWS;
 
-    // Déplacement plus lent, magnétisme plus franc
-    const CAPTURE_RADIUS=Math.min(CELL_W, CELL_H)*0.5; // zone d’aimantation
-    const SNAP_EPS_POS=0.006;  // seuil de verrouillage position
-    const SNAP_EPS_ROT=0.01;   // seuil de verrouillage rotation
-    const LERP_ALPHA_DRAG=0.25; // 0.25 = déplacement “posé” (moins rapide)
-    const LERP_ALPHA_SNAP=0.5;  // aimantation vive vers la cible
-    const LOCK_PLACED=true;
-    const MIN_CENTER_DIST=Math.min(CELL_W, CELL_H)*0.22; // anti-chevauchement
-    const Z_PLANE=0; // on travaille à z=0 (monde)
+    // Plan commun et légère élévation visuelle pendant le drag
+    const Z_PLANE = 0.0;
+    const DRAG_ELEVATION = 0.004;
 
-    /* ======== SCÈNE ======== */
+    // Déplacement posé + magnétisme fiable
+    const CAPTURE_RADIUS=Math.min(CELL_W, CELL_H)*0.5;
+    const SNAP_EPS_POS=0.006;
+    const SNAP_EPS_ROT=0.01;
+    const LERP_ALPHA_DRAG=0.25;
+    const LERP_ALPHA_SNAP=0.55;
+    const MIN_CENTER_DIST=Math.min(CELL_W, CELL_H)*0.22;
+
+    /* ===== SCÈNE ===== */
     const app=document.getElementById('app');
     const placedInfo=document.getElementById('placedInfo');
     const audioEl=document.getElementById('snapSound');
@@ -78,7 +80,7 @@
     controls.enableDamping=true; controls.dampingFactor=0.08;
     controls.enableRotate=false; controls.enablePan=true; controls.enableZoom=true;
 
-    // Plan de drag fixe en monde (z=0)
+    // Drag strictement sur le plan z=Z_PLANE
     const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1), -Z_PLANE);
 
     const raycaster=new THREE.Raycaster();
@@ -96,9 +98,6 @@
       raycaster.setFromCamera(pointer,camera);
       raycaster.ray.intersectPlane(plane,out);
       return out;
-    }
-    function worldToParentLocal(parent, worldPoint){
-      return parent.worldToLocal(worldPoint.clone());
     }
     function computePuzzleBBox(meshes){
       const bbox=new THREE.Box3();
@@ -136,7 +135,7 @@
     const loader=new GLTFLoader();
     const pieces=[];
     let puzzleRoot=null, currentBBox=null, pickableMeshes=[];
-    let zRaise=0.001; // pour mettre au-dessus la pièce saisie
+    let zSorter = 0.0; // pour l’ordre visuel en drag
 
     loader.load(MODEL_URL,(gltf)=>{
       puzzleRoot=gltf.scene;
@@ -157,7 +156,7 @@
         }
       });
 
-      // Cadrage + flip si besoin
+      // Cadrage + flip si nécessaire
       currentBBox=computePuzzleBBox(pickableMeshes);
       frameFrontView(currentBBox);
       if(!frontIsVisible(pickableMeshes)){
@@ -168,26 +167,30 @@
       }
       puzzleRoot.matrixAutoUpdate=false;
 
-      // Racines (regrouper les sous-maillages en pièces)
+      // Regrouper en pièces (noeuds racine)
       const rootSet=new Set();
       for(const m of pickableMeshes){ let n=m; while(n.parent && n.parent!==puzzleRoot) n=n.parent; rootSet.add(n); }
       const roots=[...rootSet];
 
       // Cibles grille
-      let idxAuto=0;
       const x0=-PUZZLE_W/2+CELL_W/2, y0=PUZZLE_H/2-CELL_H/2;
+      let idxAuto=0;
       function parseRowColFromName(name=''){ const m=/r(\d+)_c(\d+)/i.exec(name); return m?{r:+m[1],c:+m[2]}:null; }
-      function computeTarget(obj){
+      function targetFor(obj){
         const rc=parseRowColFromName(obj.name);
         if(rc) return new THREE.Vector3(x0+rc.c*CELL_W, y0-rc.r*CELL_H, Z_PLANE);
         const r=Math.floor(idxAuto/COLS), c=idxAuto%COLS; idxAuto=(idxAuto+1)%(ROWS*COLS);
         return new THREE.Vector3(x0+c*CELL_W, y0-r*CELL_H, Z_PLANE);
       }
+
+      // Init pièces → toutes à z = Z_PLANE
       roots.forEach(root=>{
+        root.position.z = Z_PLANE;
+        root.updateMatrixWorld(true);
         pieces.push({
           mesh:root,
-          targetPos:computeTarget(root),
-          targetQuat:new THREE.Quaternion(), // à plat
+          targetPos:targetFor(root),
+          targetQuat:new THREE.Quaternion(), // face-on
           placed:false,
           lastSafePos:root.position.clone()
         });
@@ -199,18 +202,35 @@
       updatePlacedCounter();
     }, undefined, (err)=>console.error('Erreur chargement GLB:', err));
 
-    /* ======== INTERACTION ======== */
+    /* ===== Lock helpers ===== */
+    function isLocked(node){
+      let n=node;
+      while(n){
+        if(n.userData && n.userData.locked) return true;
+        n=n.parent;
+      }
+      return false;
+    }
+    function hardLockPiece(entry){
+      entry.placed = true;
+      // Marquer toute la hiérarchie de la pièce comme verrouillée
+      entry.mesh.traverse(o => { if(o.isObject3D){ o.userData = o.userData || {}; o.userData.locked = true; }});
+      // Couper le raycast sur le root (empêche toute sélection future)
+      entry.mesh.raycast = () => {};
+    }
+
+    /* ===== Interaction ===== */
     let dragging=null, dragParent=null;
 
     function getPoint(e){ return e.touches?.[0] || e.changedTouches?.[0] || e; }
     function findRootPiece(obj){ let n=obj; while(n.parent && n.parent!==puzzleRoot) n=n.parent; return n; }
 
-    function bringFront(mesh){
-      zRaise += 0.001;
-      mesh.position.z = Z_PLANE + zRaise;
+    function elevateForDrag(mesh){
+      zSorter += 0.0005;
+      mesh.position.z = Z_PLANE + DRAG_ELEVATION + zSorter;
       mesh.updateMatrixWorld(true);
     }
-    function restoreZ(mesh){
+    function forcePlanar(mesh){
       mesh.position.z = Z_PLANE;
       mesh.updateMatrixWorld(true);
     }
@@ -221,60 +241,53 @@
       const { clientX, clientY } = getPoint(e);
       setPointerFromClient(clientX, clientY);
       raycaster.setFromCamera(pointer, camera);
-      const hits=raycaster.intersectObjects(pickableMeshes,true).filter(hit=>{
-        const root=findRootPiece(hit.object);
-        return root && !(root.userData && root.userData.locked);
-      });
+      const hits=raycaster.intersectObjects(pickableMeshes,true)
+        .filter(hit => !isLocked(hit.object));
       if(!hits.length) return;
 
       const rootMesh=findRootPiece(hits[0].object);
+      if(isLocked(rootMesh)) return; // sécurité
+
       const entry=pieces.find(p=>p.mesh===rootMesh);
-      if(!entry) return;
+      if(!entry || entry.placed) return;
 
       dragging=entry;
       dragParent = entry.mesh.parent || puzzleRoot;
       controls.enabled=false;
-      bringFront(entry.mesh);
 
-      // calcul de l’offset de saisie (monde → local parent)
+      elevateForDrag(entry.mesh);
+
+      // offset de saisie
       const worldHit=screenToWorldOnPlane(clientX,clientY,dragPlane,tmpV3);
-      const localHit=worldToParentLocal(dragParent,worldHit);
+      const localHit=dragParent.worldToLocal(worldHit.clone());
       dragOffsetLocal.copy(entry.mesh.position).sub(localHit);
 
-      // mémoriser une position sûre
       entry.lastSafePos.copy(entry.mesh.position);
     }
 
     function pointerMove(e){
-      if(!dragging) return; e.preventDefault();
+      if(!dragging || dragging.placed) return; e.preventDefault();
       const { clientX, clientY } = getPoint(e);
-
-      // position voulue (monde -> local parent), z forcé à Z_PLANE
       const worldHit=screenToWorldOnPlane(clientX,clientY,dragPlane,tmpV3);
-      const localHit=worldToParentLocal(dragParent,worldHit).add(dragOffsetLocal);
-      localHit.z = Z_PLANE + 0.0005; // léger z pour rester “au-dessus” pendant le drag
+      const localHit=dragParent.worldToLocal(worldHit.clone()).add(dragOffsetLocal);
 
-      // déplacement plus lent et stable
+      localHit.z = Z_PLANE + DRAG_ELEVATION;
       dragging.mesh.position.lerp(localHit, LERP_ALPHA_DRAG);
 
-      // magnétisme pendant le drag
-      trySnap(dragging, false);
-
-      // si non-chevauché, enregistrer comme position sûre
+      trySnap(dragging,false);
       if(!overlapsAny(dragging)) dragging.lastSafePos.copy(dragging.mesh.position);
     }
 
     function pointerUp(e){
       e.preventDefault();
       if(dragging){
-        // tentative finale
-        trySnap(dragging, true);
-
-        // si toujours non placé et chevauché → retour safe
-        if(!dragging.placed && overlapsAny(dragging)){
-          dragging.mesh.position.copy(dragging.lastSafePos);
+        if(!dragging.placed){
+          trySnap(dragging,true);
+          if(!dragging.placed && overlapsAny(dragging)){
+            dragging.mesh.position.copy(dragging.lastSafePos);
+          }
         }
-        restoreZ(dragging.mesh);
+        forcePlanar(dragging.mesh);
         dragging=null; dragParent=null;
       }
       controls.enabled=true;
@@ -284,8 +297,7 @@
       const p=entry.mesh.position;
       for(const other of pieces){
         if(other===entry) continue;
-        const d=p.distanceTo(other.mesh.position);
-        if(d<MIN_CENTER_DIST) return true;
+        if(p.distanceTo(other.mesh.position)<MIN_CENTER_DIST) return true;
       }
       return false;
     }
@@ -297,14 +309,11 @@
     function trySnap(entry, final){
       if(!entry || entry.placed) return;
 
-      // distance à la cible
       const d=entry.mesh.position.distanceTo(entry.targetPos);
       if(d > CAPTURE_RADIUS) return;
 
       // aimantation
       entry.mesh.position.lerp(entry.targetPos, LERP_ALPHA_SNAP);
-
-      // orientation (à plat)
       const a=quatAngle(entry.mesh.quaternion, entry.targetQuat);
       if(a>SNAP_EPS_ROT) entry.mesh.quaternion.slerp(entry.targetQuat, 0.6);
 
@@ -312,12 +321,15 @@
       const closeRot = quatAngle(entry.mesh.quaternion, entry.targetQuat) < SNAP_EPS_ROT;
 
       if((closePos && closeRot) || final){
-        // verrouillage exact si pas de chevauchement
         if(!overlapsAny(entry)){
+          // verrouillage exact + plan
           entry.mesh.position.copy(entry.targetPos);
           entry.mesh.quaternion.copy(entry.targetQuat);
-          entry.placed=true;
-          if(LOCK_PLACED) entry.mesh.userData.locked=true;
+          forcePlanar(entry.mesh);
+
+          // 🔒 HARD-LOCK : la pièce ne re-bougera plus jamais
+          hardLockPiece(entry);
+
           playSnap(); updatePlacedCounter();
         }
       }
@@ -329,7 +341,18 @@
       placedInfo.textContent=`${n} / ${pieces.length || (ROWS*COLS)} placées`;
     }
 
-    function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene,camera); }
+    function animate(){
+      // garde-fou : toute pièce posée reste exactement au plan
+      for(const p of pieces){
+        if(p.placed && Math.abs(p.mesh.position.z - Z_PLANE) > 1e-6){
+          p.mesh.position.z = Z_PLANE;
+          p.mesh.updateMatrixWorld(false);
+        }
+      }
+      controls.update();
+      renderer.render(scene,camera);
+      requestAnimationFrame(animate);
+    }
     animate();
 
     window.addEventListener('resize', ()=>{
@@ -339,7 +362,6 @@
       if(currentBBox) frameFrontView(currentBBox);
     });
 
-    // événements pointeur
     renderer.domElement.addEventListener('pointerdown',pointerDown,{passive:false});
     window.addEventListener('pointermove', pointerMove,{passive:false});
     window.addEventListener('pointerup',   pointerUp,  {passive:false});
@@ -347,7 +369,6 @@
     window.addEventListener('touchmove',  pointerMove,{passive:false});
     window.addEventListener('touchend',   pointerUp,  {passive:false});
 
-    // bouton Face
     document.getElementById('faceBtn').addEventListener('click', ()=> frameFrontView(currentBBox));
     window.addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='f') frameFrontView(currentBBox); });
   </script>
