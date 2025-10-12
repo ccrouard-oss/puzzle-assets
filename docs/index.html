@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Puzzle 3D — Face à plat (auto-orientation robuste)</title>
+  <title>Puzzle 3D — face à plat (flip vertical + drag/snap)</title>
   <style>
     html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
     #app{position:fixed;inset:0}
@@ -34,10 +34,14 @@
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-    // --- À adapter si besoin ---
+    // ===== Paramètres =====
     const MODEL_URL = 'puzzle_50_scattered.glb';
+    const MERGE_Z = 0.0;              // toutes les pièces au même plan
+    const DRAG_DAMPING = 0.18;        // adoucissement des déplacements
+    const SNAP_TOLERANCE = 0.12;      // 12% de la taille de pièce
+    const LOCK_ON_NEIGHBORS = 2;      // verrouille un cluster à partir de 2 liaisons
 
-    // --- Scène / caméra (orthographique, pas de perspective) ---
+    // ===== Scène / caméra =====
     const app = document.getElementById('app');
     const scene = new THREE.Scene();
     scene.background = new THREE.Color('#0d1117');
@@ -61,7 +65,7 @@
     controls.enablePan = true;
     controls.enableZoom = true;
 
-    // --- Utils ---
+    // ===== Utils =====
     function bboxOf(objects){
       const b = new THREE.Box3();
       for(const o of objects) b.expandByObject(o);
@@ -83,15 +87,18 @@
       camera.updateProjectionMatrix();
       controls.target.copy(center); controls.update();
     }
+    function setAllZFlat(root, z=MERGE_Z){
+      root.traverse(o=>{ if(o.isMesh || o.isGroup) o.position.z = z; });
+    }
 
     // “Score face” (normales → caméra)
-    const raycaster = new THREE.Raycaster();
+    const ray = new THREE.Raycaster();
     function frontScore(meshes){
       const b = bboxOf(meshes);
       const c = b.getCenter(new THREE.Vector3());
       const dir = new THREE.Vector3().subVectors(c, camera.position).normalize();
-      raycaster.set(camera.position.clone(), dir);
-      const hits = raycaster.intersectObjects(meshes, true);
+      ray.set(camera.position.clone(), dir);
+      const hits = ray.intersectObjects(meshes, true);
       if(!hits.length) return -Infinity;
       let s = 0;
       const sample = hits.slice(0, 30);
@@ -105,11 +112,10 @@
       return s / sample.length;
     }
 
-    // Aligne l’axe le plus petit (épaisseur) sur Z → face sur XY
+    // Aligne l’axe le plus fin (épaisseur) sur Z → face sur XY
     function alignThinAxisToZ(root, meshes){
       const b = bboxOf(meshes);
       const size = b.getSize(new THREE.Vector3());
-      // détecter l’axe “épaisseur”
       const axes = [
         { axis:'x', v:size.x },
         { axis:'y', v:size.y },
@@ -117,42 +123,89 @@
       ].sort((a,b)=>a.v-b.v);
       const thin = axes[0].axis;
 
-      // remettre rotations
       root.rotation.set(0,0,0);
       root.updateMatrixWorld(true);
 
-      // si épaisseur sur X → amener X sur Z (Ry ±90°)
-      if(thin === 'x'){
-        root.rotation.set(0, Math.PI/2, 0);
-      }
-      // si épaisseur sur Y → amener Y sur Z (Rx ∓90°)
-      else if(thin === 'y'){
-        root.rotation.set(-Math.PI/2, 0, 0);
-      }
-      // si déjà sur Z → rien
-
+      if(thin === 'x'){ root.rotation.set(0, Math.PI/2, 0); }
+      else if(thin === 'y'){ root.rotation.set(-Math.PI/2, 0, 0); }
       root.updateMatrixWorld(true);
 
-      // vérifie que les normales regardent la caméra (sinon flip Y)
-      const s = frontScore(meshes);
-      if(!(s>0)){
+      // Faces vers la caméra ? sinon flip horizontal
+      if(!(frontScore(meshes) > 0)){
         root.rotateY(Math.PI);
         root.updateMatrixWorld(true);
       }
     }
 
-    // --- Chargement GLB ---
+    // ===== Données puzzle =====
     const loader = new GLTFLoader();
     let puzzleRoot = null;
     let meshes = [];
     let bboxAll = null;
 
+    // ===== Drag & Snap (clusters) =====
+    class Cluster extends THREE.Group {
+      constructor(){ super(); this.isLocked=false; this.links=0; }
+    }
+    const clusters = [];
+    const pieces = []; // {mesh, cluster}
+
+    const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1), -MERGE_Z);
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    let tileW = 1, tileH = 1;
+
+    function ensureZFlat(obj){ setAllZFlat(obj, MERGE_Z); }
+
+    function computeTileSize(){
+      const xs=[], ys=[];
+      for(const p of pieces){
+        const bb = new THREE.Box3().setFromObject(p.mesh);
+        const s = bb.getSize(new THREE.Vector3());
+        xs.push(s.x); ys.push(s.y);
+      }
+      xs.sort((a,b)=>a-b); ys.sort((a,b)=>a-b);
+      const med = arr => arr.length ? arr[(arr.length>>1)] : 1;
+      tileW = med(xs)||1; tileH = med(ys)||1;
+    }
+    function makeClusterFromMesh(mesh){
+      const cl = new Cluster(); scene.add(cl);
+      moveToCluster(mesh, cl);
+      clusters.push(cl); return cl;
+    }
+    function moveToCluster(mesh, cluster){
+      const m = new THREE.Matrix4();
+      mesh.updateWorldMatrix(true,false);
+      m.copy(mesh.matrixWorld);
+      cluster.add(mesh);
+      cluster.updateWorldMatrix(true,false);
+      mesh.matrixAutoUpdate=false;
+      mesh.matrix.copy(m.premultiply(new THREE.Matrix4().copy(cluster.matrixWorld).invert()));
+      mesh.matrix.decompose(mesh.position, mesh.quaternion, mesh.scale);
+      mesh.matrixAutoUpdate=true;
+      ensureZFlat(cluster);
+    }
+    function mergeClusters(a,b){
+      if(a===b) return a;
+      for(const ch of [...b.children]) moveToCluster(ch,a);
+      for(const p of pieces){ if(p.cluster===b) p.cluster=a; }
+      clusters.splice(clusters.indexOf(b),1); scene.remove(b);
+      return a;
+    }
+    function clusterBounds(cl){
+      const b = new THREE.Box3();
+      cl.updateWorldMatrix(true,false);
+      cl.traverse(o=>{ if(o.isMesh) b.expandByObject(o); });
+      return b;
+    }
+
+    // chargement
     loader.load(MODEL_URL, (gltf)=>{
       puzzleRoot = gltf.scene;
       scene.add(puzzleRoot);
 
-      // matières côté avant
-      meshes = [];
+      // collect meshes + materials front side
+      meshes=[];
       puzzleRoot.traverse(o=>{
         if(o.isMesh){
           meshes.push(o);
@@ -161,27 +214,132 @@
         }
       });
 
-      // recentrage XY sur origine (pratique pour cadrer)
+      // recentre XY à l’origine
       const b0 = bboxOf(meshes);
       const c0 = b0.getCenter(new THREE.Vector3());
       puzzleRoot.position.sub(new THREE.Vector3(c0.x, c0.y, 0));
       puzzleRoot.updateMatrixWorld(true);
 
-      // === clé : orientation automatique sur XY ===
+      // oriente sur XY
       alignThinAxisToZ(puzzleRoot, meshes);
 
-      // cadre orthographique
+      // >>> flip vertical demandé <<<
+      puzzleRoot.rotateX(Math.PI);
+      puzzleRoot.updateMatrixWorld(true);
+
+      // place tout au même Z (plan)
+      setAllZFlat(puzzleRoot, MERGE_Z);
+      puzzleRoot.updateMatrixWorld(true);
+
+      // bbox & cadrage
       bboxAll = bboxOf(meshes);
       frameOrthoToBox(bboxAll);
+
+      // instancie les clusters/pièces
+      for(const m of meshes){
+        const cl = makeClusterFromMesh(m);
+        pieces.push({mesh:m, cluster:cl});
+      }
+      computeTileSize();
     }, undefined, (e)=> console.error('Erreur GLB:', e));
 
-    // UI recentrage
-    document.getElementById('faceBtn').addEventListener('click', ()=>{
-      if(bboxAll) frameOrthoToBox(bboxAll);
-    });
-    window.addEventListener('keydown', e => { if(e.key.toLowerCase()==='f') document.getElementById('faceBtn').click(); });
+    // ===== Drag =====
+    let dragging = null; // {cluster, grabOffset, targetPos}
+    const tmp = new THREE.Vector3(), tmp2 = new THREE.Vector3();
 
-    // Resize + render
+    function screenToPlane(x,y,out){
+      pointer.x = (x / renderer.domElement.clientWidth) * 2 - 1;
+      pointer.y = -(y / renderer.domElement.clientHeight) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      raycaster.ray.intersectPlane(dragPlane, out);
+    }
+    function pickCluster(ev){
+      pointer.x = (ev.clientX / renderer.domElement.clientWidth) * 2 - 1;
+      pointer.y = -(ev.clientY / renderer.domElement.clientHeight) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects(meshes, true);
+      if(!hits.length) return null;
+      const mesh = hits[0].object;
+      const p = pieces.find(pp=>pp.mesh===mesh);
+      if(!p || p.cluster.isLocked) return null;
+      return p.cluster;
+    }
+    function onPointerDown(ev){
+      if(!puzzleRoot) return;
+      const cl = pickCluster(ev); if(!cl) return;
+      const planePt = new THREE.Vector3(); screenToPlane(ev.clientX, ev.clientY, planePt);
+      cl.updateWorldMatrix(true,false);
+      const pos = new THREE.Vector3().setFromMatrixPosition(cl.matrixWorld);
+      const grabOffset = new THREE.Vector3().subVectors(pos, planePt);
+      dragging = { cluster:cl, grabOffset, targetPos: pos.clone() };
+      controls.enablePan = false;
+    }
+    function onPointerMove(ev){
+      if(!dragging) return;
+      const planePt = new THREE.Vector3(); screenToPlane(ev.clientX, ev.clientY, planePt);
+      dragging.targetPos.copy(planePt).add(dragging.grabOffset);
+    }
+    function onPointerUp(){
+      if(!dragging) return;
+      doSnap(dragging.cluster);
+      dragging = null;
+      controls.enablePan = true;
+    }
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+
+    // ===== Snap / Magnétisme =====
+    function doSnap(cl){
+      const refB = clusterBounds(cl);
+      const refC = refB.getCenter(new THREE.Vector3());
+      const tolX = tileW * SNAP_TOLERANCE;
+      const tolY = tileH * SNAP_TOLERANCE;
+
+      let best=null;
+      for(const other of clusters){
+        if(other===cl) continue;
+        const b = clusterBounds(other);
+        const c = b.getCenter(new THREE.Vector3());
+        const dx = c.x - refC.x, dy = c.y - refC.y;
+
+        const candidates = [
+          {axis:'x+', delta:new THREE.Vector3(tileW,0,0)},
+          {axis:'x-', delta:new THREE.Vector3(-tileW,0,0)},
+          {axis:'y+', delta:new THREE.Vector3(0,tileH,0)},
+          {axis:'y-', delta:new THREE.Vector3(0,-tileH,0)},
+        ];
+        for(const cand of candidates){
+          const ex = Math.abs(dx - cand.delta.x);
+          const ey = Math.abs(dy - cand.delta.y);
+          if(ex<=tolX && ey<=tolY){
+            const score = ex+ey;
+            if(!best || score<best.score) best = {other, delta:cand.delta, score};
+          }
+        }
+      }
+      if(!best) return;
+
+      const otherB = clusterBounds(best.other);
+      const otherC = otherB.getCenter(new THREE.Vector3());
+      const target = tmp.copy(otherC).sub(best.delta);
+      const curB = clusterBounds(cl);
+      const curC = curB.getCenter(new THREE.Vector3());
+      const move = tmp2.copy(target).sub(curC);
+      cl.position.add(move);
+      ensureZFlat(cl);
+
+      // fusion + verrouillage
+      const merged = mergeClusters(best.other, cl);
+      merged.links = (best.other.links||0) + 1;
+      ensureZFlat(merged);
+      if(merged.links >= LOCK_ON_NEIGHBORS) merged.isLocked = true;
+    }
+
+    // ===== Recentrage / Resize / Render =====
+    document.getElementById('faceBtn').addEventListener('click', ()=>{ if(bboxAll){ setAllZFlat(puzzleRoot, MERGE_Z); frameOrthoToBox(bboxAll); }});
+    window.addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='f') document.getElementById('faceBtn').click(); });
+
     function onResize(){
       renderer.setSize(window.innerWidth, window.innerHeight);
       if(bboxAll) frameOrthoToBox(bboxAll);
@@ -191,6 +349,13 @@
     (function animate(){
       requestAnimationFrame(animate);
       controls.update();
+      if(dragging){
+        const cl = dragging.cluster;
+        if(!cl.isLocked){
+          cl.position.lerp(dragging.targetPos, DRAG_DAMPING);
+          ensureZFlat(cl);
+        }
+      }
       renderer.render(scene, camera);
     })();
   </script>
