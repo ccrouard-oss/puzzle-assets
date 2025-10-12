@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-  <title>Puzzle 3D – Protect the Oceans (Face Fix)</title>
+  <title>Puzzle 3D – Protect the Oceans (GitHub Face-On)</title>
   <style>
     html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}
     #app{position:fixed;inset:0;}
@@ -70,6 +70,7 @@
     controls.enableRotate=true; controls.enablePan=true; controls.enableZoom=true;
     controls.target.copy(PUZZLE_CENTER); controls.update();
 
+    // Picking & helpers
     const raycaster=new THREE.Raycaster();
     const pointer=new THREE.Vector2();
     const tmpV3=new THREE.Vector3();
@@ -93,12 +94,7 @@
       return parent.worldToLocal(worldPoint.clone());
     }
 
-    function getParamBool(name){
-      const v=new URLSearchParams(location.search).get(name);
-      if(!v) return false;
-      return ['1','true','yes','on'].includes(v.toLowerCase());
-    }
-
+    // Orientation: mise à plat (minimise Z thickness)
     function orientFlatToXY(root){
       const candidates=[{rx:0},{rx:Math.PI/2},{rx:-Math.PI/2}];
       let best={rx:0,score:Infinity};
@@ -114,32 +110,27 @@
       root.rotation.set(best.rx,0,0);
     }
 
-    function parseRowColFromName(name=''){
-      const m=/r(\\d+)_c(\\d+)/i.exec(name);
-      return m?{r:+m[1],c:+m[2]}:null;
-    }
-
-    // Retourne {A,B,C} si r0_c0, r0_c1, r1_c0 existent, sinon null
-    function getReferencePieces(roots){
-      const map=new Map();
-      for(const r of roots){
-        const rc=parseRowColFromName(r.name);
-        if(rc) map.set(`r${rc.r}_c${rc.c}`, r);
-      }
-      const A=map.get('r0_c0'), B=map.get('r0_c1'), C=map.get('r1_c0');
-      if(!A || !B || !C) return null;
-      return {A,B,C};
-    }
-
-    // Si la normale (AB x AC) pointe vers -Z (loin de la caméra), on retourne autour de Y (vertical)
-    function ensureFacingCamera(puzzleRoot, A, B, C){
-      const a=A.getWorldPosition(new THREE.Vector3());
-      const b=B.getWorldPosition(new THREE.Vector3());
-      const c=C.getWorldPosition(new THREE.Vector3());
-      const AB=new THREE.Vector3().subVectors(b,a);
-      const AC=new THREE.Vector3().subVectors(c,a);
-      const n=new THREE.Vector3().crossVectors(AB,AC).normalize();
-      if(n.z < 0){ // on voit l'image par derrière → pivote 180° vertical (axe Y écran)
+    // Ensure we're seeing the front face: raycast to center, test face normal vs camera direction
+    function ensureFrontFacing(puzzleRoot, pickable){
+      // Build bbox & center
+      const bbox=new THREE.Box3();
+      pickable.forEach(m=>bbox.expandByObject(m));
+      const center=bbox.getCenter(new THREE.Vector3());
+      // Ray from camera to center
+      const dir=new THREE.Vector3().subVectors(center, camera.position).normalize();
+      raycaster.set(camera.position.clone(), dir);
+      const hits=raycaster.intersectObjects(pickable, true);
+      if(!hits.length) return;
+      const hit=hits[0];
+      // Compute world-space normal of the hit face
+      const normalLocal = hit.face?.normal?.clone() || new THREE.Vector3(0,0,1);
+      const normalMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
+      const normalWorld = normalLocal.applyMatrix3(normalMatrix).normalize();
+      // Camera-to-surface vector
+      const camToSurface = new THREE.Vector3().subVectors(hit.point, camera.position).normalize().negate(); // from surface to camera
+      const dot = normalWorld.dot(camToSurface);
+      // If normal points away from the camera (dot < 0), flip around Y to show front
+      if(dot < 0){
         puzzleRoot.rotateY(Math.PI);
         puzzleRoot.updateMatrixWorld(true);
       }
@@ -173,15 +164,19 @@
       puzzleRoot=gltf.scene;
       scene.add(puzzleRoot);
 
-      // 1) mise à plat de face
+      // 1) flat & face
       orientFlatToXY(puzzleRoot);
       puzzleRoot.updateMatrixWorld(true);
 
-      // 2) collecter tous les meshes
+      // 2) pickable meshes
       pickableMeshes=[];
       puzzleRoot.traverse(o=>{ if(o.isMesh) pickableMeshes.push(o); });
 
-      // 3) trouver pièces racines (premier niveau sous puzzleRoot)
+      // 3) ensure front-facing by checking hit face normal
+      ensureFrontFacing(puzzleRoot, pickableMeshes);
+      puzzleRoot.matrixAutoUpdate=false;
+
+      // 4) root pieces (first level under puzzleRoot)
       const rootSet=new Set();
       for(const m of pickableMeshes){
         let node=m; while(node.parent && node.parent!==puzzleRoot) node=node.parent;
@@ -189,26 +184,18 @@
       }
       const roots=[...rootSet];
 
-      // 4) s'orienter correctement : si l'image est vue par derrière, retourner axe Y
-      const refs = getReferencePieces(roots);
-      if(refs){
-        ensureFacingCamera(puzzleRoot, refs.A, refs.B, refs.C);
-      } else if(getParamBool('flip')){
-        // fallback manuel si noms indisponibles
-        puzzleRoot.rotateY(Math.PI);
-      }
-      puzzleRoot.matrixAutoUpdate=false;
-
-      // 5) initialisation des pièces et cibles
+      // 5) targets
       let fallbackIndexCounter=0;
       const x0=-PUZZLE_W/2+CELL_W/2, y0=PUZZLE_H/2-CELL_H/2;
+      function parseRowColFromName(name=''){
+        const m=/r(\\d+)_c(\\d+)/i.exec(name);
+        return m?{r:+m[1],c:+m[2]}:null;
+      }
       function computeTargetTransform(obj){
         if(obj.userData && obj.userData.home){
           const {pos,quat}=obj.userData.home;
-          return {
-            position:new THREE.Vector3(pos.x,pos.y,pos.z),
-            quaternion:new THREE.Quaternion(quat.x,quat.y,quat.z,quat.w)
-          };
+          return { position:new THREE.Vector3(pos.x,pos.y,pos.z),
+                   quaternion:new THREE.Quaternion(quat.x,quat.y,quat.z,quat.w) };
         }
         const rc=parseRowColFromName(obj.name);
         if(rc){
