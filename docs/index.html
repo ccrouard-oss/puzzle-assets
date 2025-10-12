@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-  <title>Puzzle 3D – Planar + Hard-Lock</title>
+  <title>Puzzle 3D – Planar Snap (profondeur corrigée)</title>
   <style>
     html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}
     #app{position:fixed;inset:0;}
@@ -44,16 +44,17 @@
     const PUZZLE_W=3.0, PUZZLE_H=4.0;
     const CELL_W=PUZZLE_W/COLS, CELL_H=PUZZLE_H/ROWS;
 
-    // Plan commun et légère élévation visuelle pendant le drag
+    // Plan commun et petite élévation visuelle pendant le drag
     const Z_PLANE = 0.0;
-    const DRAG_ELEVATION = 0.004;
+    const DRAG_ELEVATION = 0.004; // juste pour passer “au-dessus” pendant le drag
 
-    // Déplacement posé + magnétisme fiable
+    // Déplacement plus posé + magnétisme fiable
     const CAPTURE_RADIUS=Math.min(CELL_W, CELL_H)*0.5;
     const SNAP_EPS_POS=0.006;
     const SNAP_EPS_ROT=0.01;
     const LERP_ALPHA_DRAG=0.25;
     const LERP_ALPHA_SNAP=0.55;
+    const LOCK_PLACED=true;
     const MIN_CENTER_DIST=Math.min(CELL_W, CELL_H)*0.22;
 
     /* ===== SCÈNE ===== */
@@ -185,8 +186,10 @@
 
       // Init pièces → toutes à z = Z_PLANE
       roots.forEach(root=>{
+        // forcer z plan
         root.position.z = Z_PLANE;
         root.updateMatrixWorld(true);
+
         pieces.push({
           mesh:root,
           targetPos:targetFor(root),
@@ -202,23 +205,6 @@
       updatePlacedCounter();
     }, undefined, (err)=>console.error('Erreur chargement GLB:', err));
 
-    /* ===== Lock helpers ===== */
-    function isLocked(node){
-      let n=node;
-      while(n){
-        if(n.userData && n.userData.locked) return true;
-        n=n.parent;
-      }
-      return false;
-    }
-    function hardLockPiece(entry){
-      entry.placed = true;
-      // Marquer toute la hiérarchie de la pièce comme verrouillée
-      entry.mesh.traverse(o => { if(o.isObject3D){ o.userData = o.userData || {}; o.userData.locked = true; }});
-      // Couper le raycast sur le root (empêche toute sélection future)
-      entry.mesh.raycast = () => {};
-    }
-
     /* ===== Interaction ===== */
     let dragging=null, dragParent=null;
 
@@ -226,11 +212,13 @@
     function findRootPiece(obj){ let n=obj; while(n.parent && n.parent!==puzzleRoot) n=n.parent; return n; }
 
     function elevateForDrag(mesh){
+      // légère élévation visuelle pour passer au-dessus
       zSorter += 0.0005;
       mesh.position.z = Z_PLANE + DRAG_ELEVATION + zSorter;
       mesh.updateMatrixWorld(true);
     }
     function forcePlanar(mesh){
+      // remise au plan strict
       mesh.position.z = Z_PLANE;
       mesh.updateMatrixWorld(true);
     }
@@ -241,15 +229,15 @@
       const { clientX, clientY } = getPoint(e);
       setPointerFromClient(clientX, clientY);
       raycaster.setFromCamera(pointer, camera);
-      const hits=raycaster.intersectObjects(pickableMeshes,true)
-        .filter(hit => !isLocked(hit.object));
+      const hits=raycaster.intersectObjects(pickableMeshes,true).filter(hit=>{
+        const root=findRootPiece(hit.object);
+        return root && !(root.userData && root.userData.locked);
+      });
       if(!hits.length) return;
 
       const rootMesh=findRootPiece(hits[0].object);
-      if(isLocked(rootMesh)) return; // sécurité
-
       const entry=pieces.find(p=>p.mesh===rootMesh);
-      if(!entry || entry.placed) return;
+      if(!entry) return;
 
       dragging=entry;
       dragParent = entry.mesh.parent || puzzleRoot;
@@ -266,11 +254,12 @@
     }
 
     function pointerMove(e){
-      if(!dragging || dragging.placed) return; e.preventDefault();
+      if(!dragging) return; e.preventDefault();
       const { clientX, clientY } = getPoint(e);
       const worldHit=screenToWorldOnPlane(clientX,clientY,dragPlane,tmpV3);
       const localHit=dragParent.worldToLocal(worldHit.clone()).add(dragOffsetLocal);
 
+      // déplacement posé + toujours proche du plan
       localHit.z = Z_PLANE + DRAG_ELEVATION;
       dragging.mesh.position.lerp(localHit, LERP_ALPHA_DRAG);
 
@@ -281,13 +270,15 @@
     function pointerUp(e){
       e.preventDefault();
       if(dragging){
-        if(!dragging.placed){
-          trySnap(dragging,true);
-          if(!dragging.placed && overlapsAny(dragging)){
-            dragging.mesh.position.copy(dragging.lastSafePos);
-          }
+        trySnap(dragging,true);
+
+        // si toujours non placé et chevauchement → retour à une position sûre
+        if(!dragging.placed && overlapsAny(dragging)){
+          dragging.mesh.position.copy(dragging.lastSafePos);
         }
+        // dans tous les cas, remise au plan strict
         forcePlanar(dragging.mesh);
+
         dragging=null; dragParent=null;
       }
       controls.enabled=true;
@@ -322,14 +313,13 @@
 
       if((closePos && closeRot) || final){
         if(!overlapsAny(entry)){
-          // verrouillage exact + plan
+          // verrouillage exact + remise à plat stricte
           entry.mesh.position.copy(entry.targetPos);
           entry.mesh.quaternion.copy(entry.targetQuat);
           forcePlanar(entry.mesh);
 
-          // 🔒 HARD-LOCK : la pièce ne re-bougera plus jamais
-          hardLockPiece(entry);
-
+          entry.placed=true;
+          if(LOCK_PLACED) entry.mesh.userData.locked=true;
           playSnap(); updatePlacedCounter();
         }
       }
@@ -341,8 +331,8 @@
       placedInfo.textContent=`${n} / ${pieces.length || (ROWS*COLS)} placées`;
     }
 
+    // Boucle de rendu : sécurité “planar” pour toutes pièces déjà posées
     function animate(){
-      // garde-fou : toute pièce posée reste exactement au plan
       for(const p of pieces){
         if(p.placed && Math.abs(p.mesh.position.z - Z_PLANE) > 1e-6){
           p.mesh.position.z = Z_PLANE;
