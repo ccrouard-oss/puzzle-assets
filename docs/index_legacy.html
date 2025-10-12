@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Puzzle 3D — drag + magnétisme renforcé</title>
+  <style>
+    html, body { height:100%; margin:0; background:#0b1020; overflow:hidden; }
+    #app { position:fixed; inset:0; }
+    .hud {
+      position: fixed; left: 12px; top: 12px; padding: 8px 10px;
+      background: rgba(0,0,0,.45); color: #fff; font: 14px/1.4 system-ui, sans-serif;
+      border-radius: 10px; user-select: none;
+    }
+    .hud b { font-weight:700 }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<div class="hud">
+  <div><b>Pièces placées:</b> <span id="placed">0</span></div>
+  <div><b>Astuces:</b> déposer près de la cible pour l'aimantation.</div>
+</div>
+
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://unpkg.com/three@0.160.0/examples/js/loaders/GLTFLoader.js"></script>
+
+<script>
+// ---------- Scene ----------
+const el = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+el.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1020);
+const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.01, 100);
+camera.position.set(0.6, 0.7, 1.4);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.enablePan = false;
+controls.dampingFactor = 0.08;
+controls.minDistance = 0.5;
+controls.maxDistance = 3;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+const dir = new THREE.DirectionalLight(0xffffff, 0.75);
+dir.position.set(1.5, 2, 1);
+scene.add(dir);
+
+// Sol discret pour ombre douce (fausse)
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(4, 4),
+  new THREE.MeshStandardMaterial({ color:0x1a2238, roughness:0.95, metalness:0.0 })
+);
+ground.rotation.x = -Math.PI/2;
+ground.position.y = -0.001;
+scene.add(ground);
+
+// ---------- Puzzle group (for flipping) ----------
+const puzzleGroup = new THREE.Group();
+scene.add(puzzleGroup);
+
+// ---------- Globals ----------
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+const pickableMeshes = [];
+
+const pieces = [];   // { name, mesh, target: {position, quaternion}, placed:boolean }
+const targets = [];  // optional visible targets for debug
+
+let placedCount = 0;
+const placedEl = document.getElementById('placed');
+
+// ---- Drag & Snap tuning ----
+const CAPTURE_RADIUS   = 0.36;   // rayon d’accroche plus large
+const SNAP_EPS_POS     = 0.004;
+const SNAP_EPS_ROT     = 0.002;
+
+const LERP_ALPHA_DRAG  = 0.85;
+const LERP_ALPHA_SNAP  = 0.55;
+const MAX_DRAG_SPEED   = 1.25;
+
+const LOCK_PLACED      = true;
+const MIN_CENTER_DIST  = 0.12; // anti-chevauchement par centres
+
+const smoothstep = (e0,e1,x)=>{ const t = THREE.MathUtils.clamp((x-e0)/(e1-e0),0,1); return t*t*(3-2*t); };
+function angleBetweenQuats(q1,q2){
+  const dq = q1.clone().invert().multiply(q2);
+  return 2*Math.acos(THREE.MathUtils.clamp(dq.w, -1, 1));
+}
+
+// ---------- Load GLB ----------
+const loader = new THREE.GLTFLoader();
+const GLB_URL = "puzzle_50_scattered.glb"; // placé à côté de ce fichier
+loader.load(GLB_URL, (gltf)=>{
+  const root = gltf.scene;
+  root.traverse(o=>{
+    if (o.isMesh){
+      // Suppose chaque pièce est un mesh distinct
+      o.castShadow = false;
+      o.receiveShadow = false;
+      // Ajoute au groupe puzzle
+      puzzleGroup.add(o);
+      pickableMeshes.push(o);
+      pieces.push({
+        name: o.name || ('piece_'+pieces.length),
+        mesh: o,
+        target: { position: o.position.clone(), quaternion: o.quaternion.clone() }, // fallback: position actuelle
+        placed: false
+      });
+    }
+  });
+
+  // BASCULE VERTICALE (face à l’utilisateur)
+  puzzleGroup.rotation.y = Math.PI;
+  puzzleGroup.rotation.x = 0;
+  puzzleGroup.rotation.z = 0;
+
+  // Centrer le group
+  const box = new THREE.Box3().setFromObject(puzzleGroup);
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+  puzzleGroup.position.sub(center); // centre à l'origine
+  controls.target.set(0,0,0);
+  controls.update();
+
+  // Essaye de récupérer des cibles dédiées si elles existent dans le GLB
+  // - noeud "Targets" avec enfants nommés comme les pièces
+  const maybeTargets = root.getObjectByName('Targets') || root.getObjectByName('targets');
+  if (maybeTargets){
+    maybeTargets.traverse(t=>{
+      if (!t.isObject3D || t === maybeTargets) return;
+      const found = pieces.find(p=>p.name === t.name || p.name.replace(/^piece[_-]?/,'') === t.name.replace(/^target[_-]?/,''));
+      if (found){
+        found.target.position.copy(t.position);
+        found.target.quaternion.copy(t.quaternion);
+      }
+    });
+  }
+
+  // UI
+  placedCount = 0;
+  placedEl.textContent = placedCount + " / " + pieces.length;
+
+  animate();
+}, undefined, (err)=>{
+  console.error(err);
+  animate();
+});
+
+// ---------- Drag logic ----------
+let dragging = null, dragStartPos = null;
+let lastMoveT = 0;
+const dragOffsetLocal = new THREE.Vector3();
+const dragPlaneNormal = new THREE.Vector3();
+let dragPlane = null;
+const tmpV3 = new THREE.Vector3();
+const dragVel = new THREE.Vector3();
+
+function worldToParentLocal(mesh, world){
+  // world point expressed in parent's local space (mesh parent coordinates)
+  return mesh.parent.worldToLocal(world.clone());
+}
+
+function screenToWorldOnPlane(clientX, clientY, plane, out){
+  pointer.x =  (clientX / innerWidth) * 2 - 1;
+  pointer.y = -(clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hit = new THREE.Vector3();
+  raycaster.ray.intersectPlane(plane, hit);
+  out.copy(hit);
+}
+
+function findRootPiece(o){
+  // In this file, the mesh itself is the draggable piece
+  while(o && !pickableMeshes.includes(o)){
+    o = o.parent;
+  }
+  return o;
+}
+
+function updatePlacedCounter(){
+  placedCount = pieces.reduce((a,p)=>a + (p.placed?1:0), 0);
+  placedEl.textContent = placedCount + " / " + pieces.length;
+}
+
+function playSnap(){
+  // Simple click via WebAudio (evite gestion de wav externe)
+  try{
+    const ac = playSnap.ctx || (playSnap.ctx = new (window.AudioContext||window.webkitAudioContext)());
+    const o = ac.createOscillator();
+    const g = ac.createGain();
+    o.type = 'square'; o.frequency.setValueAtTime(880, ac.currentTime);
+    g.gain.setValueAtTime(0.12, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.08);
+    o.connect(g).connect(ac.destination);
+    o.start(); o.stop(ac.currentTime + 0.09);
+  }catch(e){}
+}
+
+function pointerDown(e){
+  e.preventDefault();
+  const pt = ('touches' in e)? e.touches[0] : e;
+  pointer.x =  (pt.clientX / innerWidth) * 2 - 1;
+  pointer.y = -(pt.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObjects(pickableMeshes, true).filter(h=>{
+    const root = findRootPiece(h.object);
+    return root && !(root.userData && root.userData.locked);
+  });
+  if(!hits.length) return;
+
+  const rootMesh = findRootPiece(hits[0].object);
+  const entry = pieces.find(p => p.mesh === rootMesh);
+  if(!entry) return;
+
+  dragging = entry;
+  dragStartPos = entry.mesh.position.clone();
+  dragVel.set(0,0,0);
+  controls.enabled = false;
+
+  const worldPt = entry.mesh.getWorldPosition(new THREE.Vector3());
+  dragPlaneNormal.copy(camera.getWorldDirection(new THREE.Vector3()));
+  dragPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(dragPlaneNormal, worldPt);
+
+  screenToWorldOnPlane(pt.clientX, pt.clientY, dragPlane, tmpV3);
+  const localHit = worldToParentLocal(entry.mesh, tmpV3);
+  dragOffsetLocal.copy(entry.mesh.position).sub(localHit);
+
+  entry.mesh.position.z = 0.02;
+  lastMoveT = performance.now();
+}
+
+function pointerMove(e){
+  if(!dragging) return;
+  e.preventDefault();
+
+  const now = performance.now();
+  const dt  = Math.max(0.001, (now - lastMoveT) / 1000);
+  lastMoveT = now;
+
+  const pt = ('touches' in e)? e.touches[0] : e;
+  screenToWorldOnPlane(pt.clientX, pt.clientY, dragPlane, tmpV3);
+  const targetLocal = worldToParentLocal(dragging.mesh, tmpV3).add(dragOffsetLocal);
+
+  const want = targetLocal.clone().sub(dragging.mesh.position);
+  dragVel.addScaledVector(want, LERP_ALPHA_DRAG);
+  if (dragVel.length() / dt > MAX_DRAG_SPEED) {
+    dragVel.setLength(MAX_DRAG_SPEED * dt);
+  }
+  dragging.mesh.position.add(dragVel);
+
+  tryMagnet(dragging, false);
+}
+
+function pointerUp(e){
+  e.preventDefault();
+  if (dragging) {
+    tryMagnet(dragging, true);
+    if (!dragging.placed && overlapsAny(dragging)) {
+      dragging.mesh.position.copy(dragStartPos);
+    }
+    dragging.mesh.position.z = 0.0;
+    dragging = null;
+  }
+  controls.enabled = true;
+}
+
+function overlapsAny(entry){
+  const pos = entry.mesh.position;
+  for (const other of pieces){
+    if (other === entry) continue;
+    if (other.placed && LOCK_PLACED) continue;
+    if (pos.distanceTo(other.mesh.position) < MIN_CENTER_DIST) return true;
+  }
+  return false;
+}
+
+function tryMagnet(entry, final=false){
+  if(!entry || entry.placed) return;
+  const mesh = entry.mesh, tgt = entry.target;
+  const d = mesh.position.distanceTo(tgt.position);
+  const w = 1.0 - smoothstep(0, CAPTURE_RADIUS, d);
+  if (w > 0){
+    mesh.position.lerp(tgt.position, LERP_ALPHA_SNAP * w);
+    const a = angleBetweenQuats(mesh.quaternion, tgt.quaternion);
+    if (a > SNAP_EPS_ROT){
+      mesh.quaternion.slerp(tgt.quaternion, Math.max(0.35, LERP_ALPHA_SNAP * w));
+    }
+  }
+  const closePos = mesh.position.distanceTo(tgt.position) < (final ? 3*SNAP_EPS_POS : SNAP_EPS_POS);
+  const closeRot = angleBetweenQuats(mesh.quaternion, tgt.quaternion) < (final ? 3*SNAP_EPS_ROT : SNAP_EPS_ROT);
+
+  if (d < CAPTURE_RADIUS && closePos && closeRot){
+    mesh.position.copy(tgt.position);
+    mesh.quaternion.copy(tgt.quaternion);
+    entry.placed = true;
+    if (LOCK_PLACED) mesh.userData.locked = true;
+    playSnap();
+    updatePlacedCounter();
+  }
+}
+
+// ---------- Events ----------
+renderer.domElement.addEventListener('pointerdown', pointerDown, {passive:false});
+renderer.domElement.addEventListener('pointermove', pointerMove, {passive:false});
+renderer.domElement.addEventListener('pointerup', pointerUp, {passive:false});
+renderer.domElement.addEventListener('pointerleave', pointerUp, {passive:false});
+renderer.domElement.addEventListener('touchstart', pointerDown, {passive:false});
+renderer.domElement.addEventListener('touchmove', pointerMove, {passive:false});
+renderer.domElement.addEventListener('touchend', pointerUp, {passive:false});
+
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- Loop ----------
+function animate(){
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
