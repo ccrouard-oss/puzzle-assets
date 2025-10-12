@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Puzzle 3D — Portrait + rotation 180° gauche</title>
+  <title>Puzzle 3D — Respect strict du format portrait</title>
   <style>
     html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
     #app{position:fixed;inset:0}
@@ -14,7 +14,6 @@
     .btn:hover{background:rgba(255,255,255,.12)}
     canvas{display:block; touch-action:none}
   </style>
-
   <script type="importmap">
   { "imports": {
       "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
@@ -25,7 +24,7 @@
 <body>
   <div id="app"></div>
   <div class="hud">
-    <div><b>Puzzle 3D</b> — portrait, 180° gauche</div>
+    <div><b>Puzzle 3D</b> — format image respecté</div>
     <button id="faceBtn" class="btn" title="Recentrer (F)">Face</button>
   </div>
 
@@ -34,14 +33,11 @@
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-    // ===== Paramètres =====
+    // === Paramètres ===
     const MODEL_URL = 'puzzle_50_scattered.glb';
-    const MERGE_Z = 0.0;
-    const DRAG_DAMPING = 0.18;
-    const SNAP_TOLERANCE = 0.12;
-    const LOCK_ON_NEIGHBORS = 2;
+    const DO_ROTATE_180 = false; // passe à true si tu veux retourner de 180° dans le plan
 
-    // ===== Scène / caméra =====
+    // === Scène / Caméra (orthographique, vue à plat) ===
     const app = document.getElementById('app');
     const scene = new THREE.Scene();
     scene.background = new THREE.Color('#0d1117');
@@ -61,11 +57,11 @@
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-    controls.enableRotate = false; // vue toujours à plat
+    controls.enableRotate = false; // on reste à plat
     controls.enablePan = true;
     controls.enableZoom = true;
 
-    // ===== Utils =====
+    // === Utils ===
     function bboxOf(objects){
       const b = new THREE.Box3();
       for(const o of objects) b.expandByObject(o);
@@ -87,129 +83,66 @@
       camera.updateProjectionMatrix();
       controls.target.copy(center); controls.update();
     }
-    function setAllZFlat(root, z=MERGE_Z){
-      root.traverse(o=>{ if(o.isMesh || o.isGroup) o.position.z = z; });
-    }
 
-    // faces vers caméra (score)
-    const ray = new THREE.Raycaster();
-    function frontScore(meshes){
-      const b = bboxOf(meshes);
-      const c = b.getCenter(new THREE.Vector3());
-      const dir = new THREE.Vector3().subVectors(c, camera.position).normalize();
-      ray.set(camera.position.clone(), dir);
-      const hits = ray.intersectObjects(meshes, true);
-      if(!hits.length) return -Infinity;
-      let s = 0;
-      const sample = hits.slice(0, 30);
-      for(const h of sample){
-        const nLocal = h.face?.normal?.clone() || new THREE.Vector3(0,0,1);
-        const normalMatrix = new THREE.Matrix3().getNormalMatrix(h.object.matrixWorld);
-        const nWorld = nLocal.applyMatrix3(normalMatrix).normalize();
-        const toCam = new THREE.Vector3().subVectors(camera.position, h.point).normalize();
-        s += nWorld.dot(toCam);
-      }
-      return s / sample.length;
-    }
-
-    // Aligne l’axe le plus fin sur Z (plan XY)
+    // Aligne l’axe le plus fin (épaisseur) sur Z → plan XY
     function alignThinAxisToZ(root, meshes){
       const b = bboxOf(meshes);
-      const size = b.getSize(new THREE.Vector3());
-      const axes = [
-        { axis:'x', v:size.x },
-        { axis:'y', v:size.y },
-        { axis:'z', v:size.z },
-      ].sort((a,b)=>a.v-b.v);
-      const thin = axes[0].axis;
-
+      const s = b.getSize(new THREE.Vector3());
+      const axes = [{a:'x',v:s.x},{a:'y',v:s.y},{a:'z',v:s.z}].sort((A,B)=>A.v-B.v);
+      const thin = axes[0].a;
       root.rotation.set(0,0,0);
+      if(thin==='x') root.rotation.set(0, Math.PI/2, 0);
+      else if(thin==='y') root.rotation.set(-Math.PI/2, 0, 0);
       root.updateMatrixWorld(true);
+    }
 
-      if(thin === 'x'){ root.rotation.set(0, Math.PI/2, 0); }
-      else if(thin === 'y'){ root.rotation.set(-Math.PI/2, 0, 0); }
-      root.updateMatrixWorld(true);
+    // Lit le ratio réel de la texture d’origine (si intégrée dans le GLB)
+    function getTextureAspect(meshes){
+      for(const m of meshes){
+        const matArr = Array.isArray(m.material) ? m.material : [m.material];
+        for(const mat of matArr){
+          if(mat && mat.map && mat.map.image){
+            const img = mat.map.image;
+            const w = img.naturalWidth || img.videoWidth || img.width;
+            const h = img.naturalHeight || img.videoHeight || img.height;
+            if(w && h) return w / h; // >1 paysage, <1 portrait
+          }
+        }
+      }
+      return null; // inconnu
+    }
 
-      if(!(frontScore(meshes) > 0)){
-        root.rotateY(Math.PI);
+    // Fait correspondre l’orientation XY du modèle au ratio texture (portrait/paysage)
+    function enforceOrientationToTexture(root, meshes){
+      const texAr = getTextureAspect(meshes);
+      const b = bboxOf(meshes);
+      const sx = b.getSize(new THREE.Vector3()).x;
+      const sy = b.getSize(new THREE.Vector3()).y;
+
+      if(texAr){ // si connu
+        const textureIsPortrait = texAr < 1.0;
+        const modelIsLandscape = sx > sy;
+        const modelIsPortrait  = sy >= sx;
+
+        if(textureIsPortrait && modelIsLandscape){
+          // on met le modèle en portrait pour coller à l’image source
+          root.rotateZ(Math.PI/2);
+        } else if(!textureIsPortrait && modelIsPortrait){
+          // image source paysage, modèle portrait → corrige
+          root.rotateZ(-Math.PI/2);
+        }
         root.updateMatrixWorld(true);
+      } else {
+        // fallback léger : si le modèle est paysage, on le met en portrait
+        if(sx > sy){ root.rotateZ(Math.PI/2); root.updateMatrixWorld(true); }
       }
     }
 
-    // NEW: forcer portrait (H>W) dans le plan Z, puis rotation 180° gauche
-    function enforcePortraitZ(root, meshes){
-      let b = bboxOf(meshes);
-      const size = b.getSize(new THREE.Vector3());
-      if(size.x > size.y){
-        // passe en portrait : +90° dans le plan (autour de Z)
-        root.rotateZ(Math.PI/2);
-        root.updateMatrixWorld(true);
-      }
-    }
-    function rotateLeft180Z(root){
-      // rotation plane, vers la gauche (sens trigonométrique) de 180°
-      root.rotateZ(Math.PI);
-      root.updateMatrixWorld(true);
-    }
-
-    // ===== Données puzzle + drag/snap =====
+    // === Chargement GLB ===
     const loader = new GLTFLoader();
     let puzzleRoot = null;
     let meshes = [];
     let bboxAll = null;
-
-    class Cluster extends THREE.Group { constructor(){ super(); this.isLocked=false; this.links=0; } }
-    const clusters = [];
-    const pieces = [];
-
-    const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1), -MERGE_Z);
-    const raycaster = new THREE.Raycaster();
-    const pointer = new THREE.Vector2();
-    let tileW = 1, tileH = 1;
-
-    function ensureZFlat(obj){ setAllZFlat(obj, MERGE_Z); }
-
-    function computeTileSize(){
-      const xs=[], ys=[];
-      for(const p of pieces){
-        const bb = new THREE.Box3().setFromObject(p.mesh);
-        const s = bb.getSize(new THREE.Vector3());
-        xs.push(s.x); ys.push(s.y);
-      }
-      xs.sort((a,b)=>a-b); ys.sort((a,b)=>a-b);
-      const med = arr => arr.length ? arr[(arr.length>>1)] : 1;
-      tileW = med(xs)||1; tileH = med(ys)||1;
-    }
-    function makeClusterFromMesh(mesh){
-      const cl = new Cluster(); scene.add(cl);
-      moveToCluster(mesh, cl);
-      clusters.push(cl); return cl;
-    }
-    function moveToCluster(mesh, cluster){
-      const m = new THREE.Matrix4();
-      mesh.updateWorldMatrix(true,false);
-      m.copy(mesh.matrixWorld);
-      cluster.add(mesh);
-      cluster.updateWorldMatrix(true,false);
-      mesh.matrixAutoUpdate=false;
-      mesh.matrix.copy(m.premultiply(new THREE.Matrix4().copy(cluster.matrixWorld).invert()));
-      mesh.matrix.decompose(mesh.position, mesh.quaternion, mesh.scale);
-      mesh.matrixAutoUpdate=true;
-      ensureZFlat(cluster);
-    }
-    function mergeClusters(a,b){
-      if(a===b) return a;
-      for(const ch of [...b.children]) moveToCluster(ch,a);
-      for(const p of pieces){ if(p.cluster===b) p.cluster=a; }
-      clusters.splice(clusters.indexOf(b),1); scene.remove(b);
-      return a;
-    }
-    function clusterBounds(cl){
-      const b = new THREE.Box3();
-      cl.updateWorldMatrix(true,false);
-      cl.traverse(o=>{ if(o.isMesh) b.expandByObject(o); });
-      return b;
-    }
 
     loader.load(MODEL_URL, (gltf)=>{
       puzzleRoot = gltf.scene;
@@ -219,138 +152,39 @@
       puzzleRoot.traverse(o=>{
         if(o.isMesh){
           meshes.push(o);
-          const mats = Array.isArray(o.material) ? o.material : [o.material];
-          for(const m of mats){ if(m) m.side = THREE.FrontSide; }
+          const arr = Array.isArray(o.material)?o.material:[o.material];
+          for(const m of arr){ if(m) m.side = THREE.FrontSide; }
         }
       });
 
-      // recentrer XY à l’origine
+      // recentre XY à l’origine
       const b0 = bboxOf(meshes);
       const c0 = b0.getCenter(new THREE.Vector3());
       puzzleRoot.position.sub(new THREE.Vector3(c0.x, c0.y, 0));
       puzzleRoot.updateMatrixWorld(true);
 
-      // 1) sur plan XY (épaisseur -> Z, face caméra)
+      // 1) place l’épaisseur sur Z (plan XY)
       alignThinAxisToZ(puzzleRoot, meshes);
 
-      // 2) forcer PORTRAIT (si paysage → +90° autour de Z)
-      enforcePortraitZ(puzzleRoot, meshes);
+      // 2) respecte le format d’origine de l’image (portrait/paysage) via la texture
+      enforceOrientationToTexture(puzzleRoot, meshes);
 
-      // 3) rotation demandée : 180° vers la gauche (autour de Z)
-      rotateLeft180Z(puzzleRoot);
-
-      // 4) mise à plat Z
-      setAllZFlat(puzzleRoot, MERGE_Z);
-      puzzleRoot.updateMatrixWorld(true);
+      // 3) optionnel : rotation plane 180° si demandé
+      if(DO_ROTATE_180){
+        puzzleRoot.rotateZ(Math.PI);
+        puzzleRoot.updateMatrixWorld(true);
+      }
 
       // cadrage
       bboxAll = bboxOf(meshes);
       frameOrthoToBox(bboxAll);
-
-      // clusters/pièces
-      for(const m of meshes){
-        const cl = makeClusterFromMesh(m);
-        pieces.push({mesh:m, cluster:cl});
-      }
-      computeTileSize();
     }, undefined, (e)=> console.error('Erreur GLB:', e));
 
-    // ===== Drag =====
-    let dragging = null;
-    const tmp = new THREE.Vector3(), tmp2 = new THREE.Vector3();
-
-    function screenToPlane(x,y,out){
-      pointer.x = (x / renderer.domElement.clientWidth) * 2 - 1;
-      pointer.y = -(y / renderer.domElement.clientHeight) * 2 + 1;
-      raycaster.setFromCamera(pointer, camera);
-      raycaster.ray.intersectPlane(dragPlane, out);
-    }
-    function pickCluster(ev){
-      pointer.x = (ev.clientX / renderer.domElement.clientWidth) * 2 - 1;
-      pointer.y = -(ev.clientY / renderer.domElement.clientHeight) * 2 + 1;
-      raycaster.setFromCamera(pointer, camera);
-      const hits = raycaster.intersectObjects(meshes, true);
-      if(!hits.length) return null;
-      const mesh = hits[0].object;
-      const p = pieces.find(pp=>pp.mesh===mesh);
-      if(!p || p.cluster.isLocked) return null;
-      return p.cluster;
-    }
-    function onPointerDown(ev){
-      if(!puzzleRoot) return;
-      const cl = pickCluster(ev); if(!cl) return;
-      const planePt = new THREE.Vector3(); screenToPlane(ev.clientX, ev.clientY, planePt);
-      cl.updateWorldMatrix(true,false);
-      const pos = new THREE.Vector3().setFromMatrixPosition(cl.matrixWorld);
-      const grabOffset = new THREE.Vector3().subVectors(pos, planePt);
-      dragging = { cluster:cl, grabOffset, targetPos: pos.clone() };
-      controls.enablePan = false;
-    }
-    function onPointerMove(ev){
-      if(!dragging) return;
-      const planePt = new THREE.Vector3(); screenToPlane(ev.clientX, ev.clientY, planePt);
-      dragging.targetPos.copy(planePt).add(dragging.grabOffset);
-    }
-    function onPointerUp(){
-      if(!dragging) return;
-      doSnap(dragging.cluster);
-      dragging = null;
-      controls.enablePan = true;
-    }
-    renderer.domElement.addEventListener('pointerdown', onPointerDown);
-    window.addEventListener('pointermove', onPointerMove);
-    window.addEventListener('pointerup', onPointerUp);
-
-    // ===== Snap / Magnétisme =====
-    function doSnap(cl){
-      const refB = clusterBounds(cl);
-      const refC = refB.getCenter(new THREE.Vector3());
-      const tolX = tileW * SNAP_TOLERANCE;
-      const tolY = tileH * SNAP_TOLERANCE;
-
-      let best=null;
-      for(const other of clusters){
-        if(other===cl) continue;
-        const b = clusterBounds(other);
-        const c = b.getCenter(new THREE.Vector3());
-        const dx = c.x - refC.x, dy = c.y - refC.y;
-
-        const candidates = [
-          {axis:'x+', delta:new THREE.Vector3(tileW,0,0)},
-          {axis:'x-', delta:new THREE.Vector3(-tileW,0,0)},
-          {axis:'y+', delta:new THREE.Vector3(0,tileH,0)},
-          {axis:'y-', delta:new THREE.Vector3(0,-tileH,0)},
-        ];
-        for(const cand of candidates){
-          const ex = Math.abs(dx - cand.delta.x);
-          const ey = Math.abs(dy - cand.delta.y);
-          if(ex<=tolX && ey<=tolY){
-            const score = ex+ey;
-            if(!best || score<best.score) best = {other, delta:cand.delta, score};
-          }
-        }
-      }
-      if(!best) return;
-
-      const otherB = clusterBounds(best.other);
-      const otherC = otherB.getCenter(new THREE.Vector3());
-      const target = tmp.copy(otherC).sub(best.delta);
-      const curB = clusterBounds(cl);
-      const curC = curB.getCenter(new THREE.Vector3());
-      const move = tmp2.copy(target).sub(curC);
-      cl.position.add(move);
-      ensureZFlat(cl);
-
-      const merged = mergeClusters(best.other, cl);
-      merged.links = (best.other.links||0) + 1;
-      ensureZFlat(merged);
-      if(merged.links >= LOCK_ON_NEIGHBORS) merged.isLocked = true;
-    }
-
-    // ===== Recentrage / Resize / Render =====
-    document.getElementById('faceBtn').addEventListener('click', ()=>{ if(bboxAll){ setAllZFlat(puzzleRoot, MERGE_Z); frameOrthoToBox(bboxAll); }});
+    // UI recentrage
+    document.getElementById('faceBtn').addEventListener('click', ()=>{ if(bboxAll) frameOrthoToBox(bboxAll); });
     window.addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='f') document.getElementById('faceBtn').click(); });
 
+    // Resize + render
     function onResize(){
       renderer.setSize(window.innerWidth, window.innerHeight);
       if(bboxAll) frameOrthoToBox(bboxAll);
@@ -360,13 +194,6 @@
     (function animate(){
       requestAnimationFrame(animate);
       controls.update();
-      if(dragging){
-        const cl = dragging.cluster;
-        if(!cl.isLocked){
-          cl.position.lerp(dragging.targetPos, DRAG_DAMPING);
-          ensureZFlat(cl);
-        }
-      }
       renderer.render(scene, camera);
     })();
   </script>
