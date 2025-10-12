@@ -3,17 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Puzzle 3D — Face, à plat (Ortho)</title>
+  <title>Puzzle 3D — Face à plat + Drag & Magnet</title>
   <style>
     html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
     #app{position:fixed;inset:0}
     .hud{position:fixed;left:12px;top:12px;z-index:5;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);
-      padding:10px 12px;border-radius:12px;backdrop-filter:blur(6px);font-size:13px;display:flex;gap:10px;align-items:center}
+      padding:8px 10px;border-radius:10px;backdrop-filter:blur(6px);font-size:13px;display:flex;gap:10px;align-items:center}
     .btn{cursor:pointer;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#e6edf3;
       padding:6px 10px;border-radius:8px;font-size:12px}
     .btn:hover{background:rgba(255,255,255,.12)}
-    .row{display:flex;gap:8px;align-items:center}
-    input[type="range"]{width:180px}
     canvas{display:block; touch-action:none}
   </style>
   <script type="importmap">
@@ -26,13 +24,8 @@
 <body>
   <div id="app"></div>
   <div class="hud">
-    <div class="row">
-      <button id="faceBtn" class="btn" title="Recentrer (F)">Face</button>
-      <button id="rotL" class="btn" title="Tourner -5° (←)">↺</button>
-      <button id="rotR" class="btn" title="Tourner +5° (→)">↻</button>
-      <label for="rot">Rotation</label>
-      <input id="rot" type="range" min="-180" max="180" step="1" value="0" />
-    </div>
+    <div><b>Puzzle 3D</b> – face à plat</div>
+    <button id="faceBtn" class="btn" title="Recentrer (F)">Face</button>
   </div>
 
   <script type="module">
@@ -40,14 +33,19 @@
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-    // --- À adapter si besoin ---
+    // ================== PARAMS ==================
     const MODEL_URL = 'puzzle_50_scattered.glb';
+    const DRAG_DAMPING = 0.18;          // 0..1 (plus petit = plus lent/doux)
+    const SNAP_TOLERANCE = 0.12;        // en multiple de la taille de pièce (≈ 12%)
+    const MERGE_Z = 0.0;                // toutes les pièces/cluster sur ce Z
+    const LOCK_ON_NEIGHBORS = 2;        // verouille un cluster dès qu’il a >= N liaisons snap
 
+    // ================== SCÈNE ===================
     const app = document.getElementById('app');
     const scene = new THREE.Scene();
     scene.background = new THREE.Color('#0d1117');
 
-    // Caméra orthographique — toujours face au puzzle (aucune perspective)
+    // Caméra orthographique – vue de face
     const camera = new THREE.OrthographicCamera(-1,1,1,-1,0.01,1000);
     camera.position.set(0,0,10);
     camera.up.set(0,1,0);
@@ -58,21 +56,36 @@
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     app.appendChild(renderer.domElement);
 
-    // Lumière douce
     scene.add(new THREE.HemisphereLight(0xffffff, 0x334466, 0.9));
     const dir = new THREE.DirectionalLight(0xffffff, 0.5); dir.position.set(2,3,4); scene.add(dir);
 
-    // Contrôles: pas de rotation de caméra (reste face), pan+zoom OK
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-    controls.enableRotate = false;
+    controls.enableRotate = false; // vue reste à plat
     controls.enablePan = true;
     controls.enableZoom = true;
 
+    // ================== CHARGEMENT ==============
     const loader = new GLTFLoader();
     let puzzleRoot = null;
-    let pickable = [];
-    let bbox = null;
+    let pieces = [];         // {mesh, cluster, bboxSize, neighbors}
+    let bboxAll = null;
+    let tileW = 1, tileH = 1;
+
+    // plan XY pour les intersections souris → déplacement
+    const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1), -MERGE_Z);
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    // Cluster = Group de pièces qui bougent ensemble
+    class Cluster extends THREE.Group {
+      constructor() {
+        super();
+        this.isLocked = false;
+        this.links = 0; // nombre de “liaisons” snap établies
+      }
+    }
+    const clusters = [];
 
     function computeBBox(objs){
       const b = new THREE.Box3();
@@ -80,34 +93,79 @@
       return b;
     }
 
-    // Cadrage orthographique de face
     function frameFront(b){
       if(!b) return;
       const size = new THREE.Vector3(); b.getSize(size);
       const center = b.getCenter(new THREE.Vector3());
-      const pad = 1.10; // 10% de marge
+      const pad = 1.10;
       const needW = size.x * pad, needH = size.y * pad;
       const a = window.innerWidth / window.innerHeight;
       let viewW, viewH;
-      if (needW / needH > a) {
-        viewW = needW / 2;
-        viewH = (needW / a) / 2;
-      } else {
-        viewH = needH / 2;
-        viewW = (needH * a) / 2;
-      }
+      if (needW / needH > a) { viewW = needW/2; viewH = (needW/a)/2; }
+      else { viewH = needH/2; viewW = (needH*a)/2; }
       camera.left = -viewW; camera.right = viewW;
       camera.top = viewH; camera.bottom = -viewH;
       camera.position.set(center.x, center.y, 10);
       camera.lookAt(center);
       camera.updateProjectionMatrix();
-      controls.target.copy(center);
-      controls.update();
+      controls.target.copy(center); controls.update();
     }
 
-    // Si le modèle est vu par l’arrière, on le retourne
-    const raycaster = new THREE.Raycaster();
-    function isFrontVisible(meshes){
+    function estimateTileSize(){
+      // médiane des tailles de bbox mesh (X,Y)
+      const xs = [], ys = [];
+      for(const p of pieces){
+        const bb = new THREE.Box3().setFromObject(p.mesh);
+        const s = bb.getSize(new THREE.Vector3());
+        xs.push(s.x); ys.push(s.y);
+      }
+      xs.sort((a,b)=>a-b); ys.sort((a,b)=>a-b);
+      const med = arr => arr.length ? arr[(arr.length>>1)] : 1;
+      tileW = med(xs) || 1;
+      tileH = med(ys) || 1;
+    }
+
+    function ensureZFlat(obj){
+      obj.traverse(o=>{
+        if(o.isMesh || o.isGroup) o.position.z = MERGE_Z;
+      });
+    }
+
+    function makeClusterFromMesh(mesh){
+      const cl = new Cluster();
+      scene.add(cl);
+      moveToCluster(mesh, cl);
+      return cl;
+    }
+
+    function moveToCluster(mesh, cluster){
+      // préserver transform monde
+      const m = new THREE.Matrix4();
+      mesh.updateWorldMatrix(true, false);
+      m.copy(mesh.matrixWorld);
+      cluster.add(mesh);
+      cluster.updateWorldMatrix(true, false);
+      // appliquer transform monde inverse pour conserver la pos
+      mesh.matrixAutoUpdate = false;
+      mesh.matrix.copy(m.premultiply(new THREE.Matrix4().copy(cluster.matrixWorld).invert()));
+      mesh.matrix.decompose(mesh.position, mesh.quaternion, mesh.scale);
+      mesh.matrixAutoUpdate = true;
+      ensureZFlat(cluster);
+    }
+
+    function mergeClusters(a, b){
+      if(a===b) return a;
+      // déplacer tous les enfants de b dans a (conserver transforms)
+      const toMove = [...b.children];
+      for(const ch of toMove) moveToCluster(ch, a);
+      // mettre à jour références
+      for(const p of pieces){ if(p.cluster===b) p.cluster = a; }
+      const idx = clusters.indexOf(b); if(idx>=0) clusters.splice(idx,1);
+      scene.remove(b);
+      return a;
+    }
+
+    function frontIsVisible(meshes){
       if(!meshes.length) return true;
       const b = computeBBox(meshes);
       const c = b.getCenter(new THREE.Vector3());
@@ -125,78 +183,211 @@
 
     loader.load(MODEL_URL, (gltf)=>{
       puzzleRoot = gltf.scene;
-      puzzleRoot.rotation.set(0,0,0);
-      puzzleRoot.updateMatrixWorld(true);
       scene.add(puzzleRoot);
 
-      pickable = [];
+      // collecter les meshes (pièces)
       puzzleRoot.traverse(o=>{
         if(o.isMesh){
-          pickable.push(o);
+          const cluster = makeClusterFromMesh(o);
+          const item = { mesh:o, cluster, neighbors:0 };
+          pieces.push(item);
+          clusters.push(cluster);
           const mats = Array.isArray(o.material) ? o.material : [o.material];
-          for(const m of mats){ if(m && m.side !== THREE.FrontSide) m.side = THREE.FrontSide; }
+          for(const m of mats){ if(m) m.side = THREE.FrontSide; }
         }
       });
 
-      bbox = computeBBox(pickable);
-      frameFront(bbox);
+      // bbox globale (toutes pièces)
+      bboxAll = computeBBox(pieces.map(p=>p.mesh));
+      frameFront(bboxAll);
 
-      // Auto-flip si nécessaire
-      if(!isFrontVisible(pickable)){
+      // si l’image est vue par l’arrière → flip
+      const allMeshes = pieces.map(p=>p.mesh);
+      if(!frontIsVisible(allMeshes)){
         puzzleRoot.rotateX(Math.PI);
         puzzleRoot.updateMatrixWorld(true);
-        if(!isFrontVisible(pickable)){
+        if(!frontIsVisible(allMeshes)){
           puzzleRoot.rotateX(-Math.PI);
           puzzleRoot.rotateY(Math.PI);
           puzzleRoot.updateMatrixWorld(true);
         }
-        bbox = computeBBox(pickable);
-        frameFront(bbox);
+        bboxAll = computeBBox(pieces.map(p=>p.mesh));
+        frameFront(bboxAll);
       }
+
+      estimateTileSize();
+      ensureZFlat(puzzleRoot);
     }, undefined, (e)=> console.error('Erreur GLB:', e));
 
-    // UI rotation in-plane (Z)
-    const rotSlider = document.getElementById('rot');
-    const rotL = document.getElementById('rotL');
-    const rotR = document.getElementById('rotR');
-    const faceBtn = document.getElementById('faceBtn');
+    // ================== DRAG & SNAP ==================
+    let dragging = null; // {cluster, grabOffset:Vector3, targetPos:Vector3}
+    const tmpV = new THREE.Vector3(), tmpV2 = new THREE.Vector3();
 
-    function setRotationDeg(d){
+    function screenToPlane(x, y, outPoint){
+      pointer.x = (x / renderer.domElement.clientWidth) * 2 - 1;
+      pointer.y = -(y / renderer.domElement.clientHeight) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const pt = new THREE.Vector3();
+      raycaster.ray.intersectPlane(dragPlane, pt);
+      outPoint.copy(pt);
+    }
+
+    function pickCluster(ev){
+      pointer.x = (ev.clientX / renderer.domElement.clientWidth) * 2 - 1;
+      pointer.y = -(ev.clientY / renderer.domElement.clientHeight) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects(pieces.map(p=>p.mesh), true);
+      if(!hits.length) return null;
+      const mesh = hits[0].object;
+      const piece = pieces.find(p=>p.mesh===mesh);
+      if(!piece) return null;
+      const cl = piece.cluster;
+      if(cl.isLocked) return null;
+      return cl;
+    }
+
+    function onPointerDown(ev){
       if(!puzzleRoot) return;
-      const rad = THREE.MathUtils.degToRad(d);
-      // On ne touche qu’à Z pour rester à plat
-      puzzleRoot.rotation.set(0,0,rad);
-      puzzleRoot.updateMatrixWorld(true);
-      // recadre légèrement (bbox ne change pas avec pure rotZ, mais on recentre)
-      frameFront(bbox);
+      const cl = pickCluster(ev);
+      if(!cl) return;
+      const planePt = new THREE.Vector3();
+      screenToPlane(ev.clientX, ev.clientY, planePt);
+      cl.updateWorldMatrix(true, false);
+      const clWorldPos = new THREE.Vector3().setFromMatrixPosition(cl.matrixWorld);
+      const grabOffset = new THREE.Vector3().subVectors(clWorldPos, planePt);
+      dragging = { cluster: cl, grabOffset, targetPos: clWorldPos.clone() };
+      controls.enablePan = false;
     }
 
-    rotSlider.addEventListener('input', e => setRotationDeg(parseFloat(e.target.value)));
-    rotL.addEventListener('click', ()=>{ rotSlider.value = (+rotSlider.value - 5).toString(); setRotationDeg(+rotSlider.value); });
-    rotR.addEventListener('click', ()=>{ rotSlider.value = (+rotSlider.value + 5).toString(); setRotationDeg(+rotSlider.value); });
-    faceBtn.addEventListener('click', ()=>{ rotSlider.value = "0"; setRotationDeg(0); });
-
-    // Raccourcis
-    window.addEventListener('keydown', (e)=>{
-      const k = e.key.toLowerCase();
-      if(k==='f'){ rotSlider.value="0"; setRotationDeg(0); }
-      if(k==='arrowleft'){ rotSlider.value = (+rotSlider.value - 5).toString(); setRotationDeg(+rotSlider.value); }
-      if(k==='arrowright'){ rotSlider.value = (+rotSlider.value + 5).toString(); setRotationDeg(+rotSlider.value); }
-    });
-
-    // Resize
-    function onResize(){
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      if(bbox) frameFront(bbox);
+    function onPointerMove(ev){
+      if(!dragging) return;
+      const planePt = new THREE.Vector3();
+      screenToPlane(ev.clientX, ev.clientY, planePt);
+      dragging.targetPos.copy(planePt).add(dragging.grabOffset);
     }
-    window.addEventListener('resize', onResize);
 
-    // Render loop
+    function onPointerUp(){
+      if(!dragging) return;
+      // à la fin du drag → magnétisme
+      doSnap(dragging.cluster);
+      dragging = null;
+      controls.enablePan = true;
+    }
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+
+    function rectOverlap(a, b){
+      // a,b: THREE.Box3 dans XY; retourne aire de recouvrement approx (si négatif → pas de recouvrement)
+      const ax1=a.min.x, ax2=a.max.x, ay1=a.min.y, ay2=a.max.y;
+      const bx1=b.min.x, bx2=b.max.x, by1=b.min.y, by2=b.max.y;
+      const w = Math.min(ax2,bx2) - Math.max(ax1,bx1);
+      const h = Math.min(ay2,by2) - Math.max(ay1,by1);
+      return Math.min(w,0) < 0 || Math.min(h,0) < 0 ? -1 : (w*h);
+    }
+
+    function clusterBounds(cl){
+      const b = new THREE.Box3();
+      cl.updateWorldMatrix(true,false);
+      cl.traverse(o=>{ if(o.isMesh) b.expandByObject(o); });
+      return b;
+    }
+
+    function doSnap(cl){
+      // Rechercher cluster voisin le plus proche avec offsets ~ (±tileW,0) ou (0,±tileH)
+      const bRef = clusterBounds(cl);
+      const cRef = bRef.getCenter(new THREE.Vector3());
+      const tolX = tileW * SNAP_TOLERANCE;
+      const tolY = tileH * SNAP_TOLERANCE;
+
+      let best = null; // {other, delta, axis}
+      for(const other of clusters){
+        if(other===cl) continue;
+        if(other.isLocked) ; // on peut snap sur un locked (utile)
+        const bO = clusterBounds(other);
+        const cO = bO.getCenter(new THREE.Vector3());
+        const dx = cO.x - cRef.x;
+        const dy = cO.y - cRef.y;
+
+        // tester quatre cas de voisinage
+        const candidates = [
+          {axis:'x+', delta:new THREE.Vector3(tileW,0,0)},
+          {axis:'x-', delta:new THREE.Vector3(-tileW,0,0)},
+          {axis:'y+', delta:new THREE.Vector3(0,tileH,0)},
+          {axis:'y-', delta:new THREE.Vector3(0,-tileH,0)},
+        ];
+        for(const c of candidates){
+          const ex = Math.abs(dx - c.delta.x);
+          const ey = Math.abs(dy - c.delta.y);
+          if(ex <= tolX && ey <= tolY){
+            const score = ex + ey;
+            if(!best || score < best.score) best = {other, axis:c.axis, delta:c.delta.clone(), score};
+          }
+        }
+      }
+
+      if(!best) return; // rien à snapper
+
+      // Prochaine position (alignement exact sur l’offset attendu)
+      const bO = clusterBounds(best.other);
+      const cO = bO.getCenter(new THREE.Vector3());
+      const target = tmpV.copy(cO).sub(best.delta);
+      // déplacer tout le cluster pour que son centre corresponde à target
+      const bRef2 = clusterBounds(cl);
+      const cRef2 = bRef2.getCenter(new THREE.Vector3());
+      const move = tmpV2.copy(target).sub(cRef2);
+      cl.position.add(move);
+      ensureZFlat(cl);
+
+      // collision grossière ? éviter recouvrement
+      const after = clusterBounds(cl);
+      if(rectOverlap(after, bO) > 0){
+        // léger écart latéral si chevauchement
+        if(best.axis.startsWith('x')) cl.position.y += (after.getSize(new THREE.Vector3()).y*0.02) * (best.axis==='x+'?1:-1);
+        else cl.position.x += (after.getSize(new THREE.Vector3()).x*0.02) * (best.axis==='y+'?1:-1);
+        ensureZFlat(cl);
+      }
+
+      // fusionner clusters et incrémenter liaisons
+      const merged = mergeClusters(best.other, cl);
+      merged.links = (best.other.links||0) + 1;
+      ensureZFlat(merged);
+
+      // verrouillage si assez de liaisons (paramétrable)
+      if(merged.links >= LOCK_ON_NEIGHBORS){
+        merged.isLocked = true;
+      }
+    }
+
+    // ================== RECENTRAGE ==================
+    document.getElementById('faceBtn').addEventListener('click', ()=> frameFront(bboxAll));
+    window.addEventListener('keydown', e => { if(e.key.toLowerCase()==='f') frameFront(bboxAll); });
+
+    // ================== RENDER ==================
     (function animate(){
       requestAnimationFrame(animate);
       controls.update();
+
+      // drag smoothing
+      if(dragging){
+        const cl = dragging.cluster;
+        if(!cl.isLocked){
+          // Lerp vers la cible — déplacements plus “lents/naturels”
+          cl.position.lerp(dragging.targetPos, DRAG_DAMPING);
+          ensureZFlat(cl);
+        }
+      }
+
       renderer.render(scene, camera);
     })();
+
+    // ================== RESIZE ==================
+    function onResize(){
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      if(bboxAll) frameFront(bboxAll);
+    }
+    window.addEventListener('resize', onResize);
   </script>
 </body>
 </html>
