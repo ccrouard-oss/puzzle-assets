@@ -2,331 +2,327 @@
 <html lang="fr">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Puzzle 3D — drag + magnétisme renforcé</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Puzzle 3D – Protect the Oceans (Face-On Robust)</title>
   <style>
-    html, body { height:100%; margin:0; background:#0b1020; overflow:hidden; }
-    #app { position:fixed; inset:0; }
-    .hud {
-      position: fixed; left: 12px; top: 12px; padding: 8px 10px;
-      background: rgba(0,0,0,.45); color: #fff; font: 14px/1.4 system-ui, sans-serif;
-      border-radius: 10px; user-select: none;
-    }
-    .hud b { font-weight:700 }
+    html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}
+    #app{position:fixed;inset:0;}
+    .hud{position:fixed;left:12px;top:12px;z-index:5;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);
+      padding:8px 10px;border-radius:10px;backdrop-filter:blur(6px);font-size:13px;line-height:1.35;display:flex;gap:10px;align-items:center}
+    .hud b{color:#fff;}
+    .badge{display:inline-block;padding:2px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.1);}
+    .btn{cursor:pointer;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#e6edf3;
+      padding:6px 10px;border-radius:8px;font-size:12px}
+    .btn:hover{background:rgba(255,255,255,.12)}
+    canvas{display:block; touch-action:none;}
   </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  } }
+  </script>
 </head>
 <body>
-<div id="app"></div>
-<div class="hud">
-  <div><b>Pièces placées:</b> <span id="placed">0</span></div>
-  <div><b>Astuces:</b> déposer près de la cible pour l'aimantation.</div>
-</div>
+  <div id="app"></div>
+  <div class="hud">
+    <div><b>Puzzle 3D</b> – Protect the Oceans</div>
+    <div class="badge" id="placedInfo">0 / 50 placées</div>
+    <button id="faceBtn" class="btn" title="Recadrer face (touche F)">Face</button>
+  </div>
+  <audio id="snapSound" src="click.wav" preload="auto"></audio>
 
-<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
-<script src="https://unpkg.com/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
-<script src="https://unpkg.com/three@0.160.0/examples/js/loaders/GLTFLoader.js"></script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-<script>
-// ---------- Scene ----------
-const el = document.getElementById('app');
-const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.setSize(innerWidth, innerHeight);
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-el.appendChild(renderer.domElement);
+    const MODEL_URL='puzzle_50_scattered.glb';
+    const ROWS=5, COLS=10;
+    const PUZZLE_W=3.0, PUZZLE_H=4.0;
+    const CELL_W=PUZZLE_W/COLS, CELL_H=PUZZLE_H/ROWS;
 
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b1020);
-const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.01, 100);
-camera.position.set(0.6, 0.7, 1.4);
+    const CAPTURE_RADIUS=0.18, SNAP_EPS_POS=0.002, SNAP_EPS_ROT=0.001;
+    const LERP_ALPHA_DRAG=0.6, LERP_ALPHA_SNAP=0.35;
+    const LOCK_PLACED=true;
+    const MIN_CENTER_DIST=Math.min(CELL_W, CELL_H)*0.18;
 
-const controls = new THREE.OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.enablePan = false;
-controls.dampingFactor = 0.08;
-controls.minDistance = 0.5;
-controls.maxDistance = 3;
+    const app=document.getElementById('app');
+    const scene=new THREE.Scene();
+    scene.background=new THREE.Color('#0d1117');
 
-scene.add(new THREE.AmbientLight(0xffffff, 0.9));
-const dir = new THREE.DirectionalLight(0xffffff, 0.75);
-dir.position.set(1.5, 2, 1);
-scene.add(dir);
+    const camera=new THREE.PerspectiveCamera(50,window.innerWidth/window.innerHeight,0.01,100);
+    camera.position.set(0,0,6.0); camera.up.set(0,1,0);
 
-// Sol discret pour ombre douce (fausse)
-const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(4, 4),
-  new THREE.MeshStandardMaterial({ color:0x1a2238, roughness:0.95, metalness:0.0 })
-);
-ground.rotation.x = -Math.PI/2;
-ground.position.y = -0.001;
-scene.add(ground);
+    const renderer=new THREE.WebGLRenderer({antialias:true});
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+    renderer.setSize(window.innerWidth,window.innerHeight);
+    renderer.outputColorSpace=THREE.SRGBColorSpace;
+    app.appendChild(renderer.domElement);
 
-// ---------- Puzzle group (for flipping) ----------
-const puzzleGroup = new THREE.Group();
-scene.add(puzzleGroup);
+    scene.add(new THREE.HemisphereLight(0xffffff,0x334466,0.7));
+    const dir=new THREE.DirectionalLight(0xffffff,0.8); dir.position.set(2,3,4); scene.add(dir);
 
-// ---------- Globals ----------
-const raycaster = new THREE.Raycaster();
-const pointer = new THREE.Vector2();
-const pickableMeshes = [];
+    const controls=new OrbitControls(camera,renderer.domElement);
+    controls.enableDamping=true; controls.dampingFactor=0.08;
+    controls.enableRotate=true; controls.enablePan=true; controls.enableZoom=true;
 
-const pieces = [];   // { name, mesh, target: {position, quaternion}, placed:boolean }
-const targets = [];  // optional visible targets for debug
+    const raycaster=new THREE.Raycaster();
+    const pointer=new THREE.Vector2();
+    const tmpV3=new THREE.Vector3();
+    let dragPlane=null;
+    const dragOffsetLocal=new THREE.Vector3();
 
-let placedCount = 0;
-const placedEl = document.getElementById('placed');
+    function screenToWorldOnPlane(clientX, clientY, plane, out){
+      const rect=renderer.domElement.getBoundingClientRect();
+      pointer.x=((clientX-rect.left)/rect.width)*2-1;
+      pointer.y=-((clientY-rect.top)/rect.height)*2+1;
+      raycaster.setFromCamera(pointer,camera);
+      raycaster.ray.intersectPlane(plane,out);
+      return out;
+    }
+    function makeScreenDragPlane(cam, worldPoint){
+      const n=cam.getWorldDirection(new THREE.Vector3());
+      return new THREE.Plane().setFromNormalAndCoplanarPoint(n, worldPoint);
+    }
+    function worldToParentLocal(obj, worldPoint){
+      const parent=obj.parent||scene;
+      return parent.worldToLocal(worldPoint.clone());
+    }
 
-// ---- Drag & Snap tuning ----
-const CAPTURE_RADIUS   = 0.36;   // rayon d’accroche plus large
-const SNAP_EPS_POS     = 0.004;
-const SNAP_EPS_ROT     = 0.002;
+    function computePuzzleBBox(meshes){
+      const bbox=new THREE.Box3();
+      meshes.forEach(m=>bbox.expandByObject(m));
+      return bbox;
+    }
+    function frameFrontView(bbox){
+      if(!bbox) return;
+      const size=new THREE.Vector3(); bbox.getSize(size);
+      const center=bbox.getCenter(new THREE.Vector3());
+      const maxDim=Math.max(size.x,size.y);
+      const fov=THREE.MathUtils.degToRad(camera.fov);
+      const dist=(maxDim*0.6)/Math.tan(fov/2);
+      camera.position.set(center.x, center.y, dist);
+      camera.lookAt(center);
+      controls.target.copy(center);
+      controls.update();
+    }
 
-const LERP_ALPHA_DRAG  = 0.85;
-const LERP_ALPHA_SNAP  = 0.55;
-const MAX_DRAG_SPEED   = 1.25;
+    // Check if front is visible using face normal vs camera direction
+    function frontIsVisible(pickable){
+      if(!pickable.length) return true;
+      const bbox = computePuzzleBBox(pickable);
+      const center = bbox.getCenter(new THREE.Vector3());
+      const dir = new THREE.Vector3().subVectors(center, camera.position).normalize();
+      raycaster.set(camera.position.clone(), dir);
+      const hits = raycaster.intersectObjects(pickable, true);
+      if(!hits.length) return true;
+      const hit = hits[0];
+      const normalLocal = hit.face?.normal?.clone() || new THREE.Vector3(0,0,1);
+      const normalMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
+      const normalWorld = normalLocal.applyMatrix3(normalMatrix).normalize();
+      const surfaceToCamera = new THREE.Vector3().subVectors(camera.position, hit.point).normalize();
+      const dot = normalWorld.dot(surfaceToCamera);
+      return dot > 0; // front if normal points towards camera
+    }
 
-const LOCK_PLACED      = true;
-const MIN_CENTER_DIST  = 0.12; // anti-chevauchement par centres
+    const loader=new GLTFLoader();
+    const pieces=[];
+    let puzzleRoot=null, currentBBox=null;
+    let pickableMeshes=[];
 
-const smoothstep = (e0,e1,x)=>{ const t = THREE.MathUtils.clamp((x-e0)/(e1-e0),0,1); return t*t*(3-2*t); };
-function angleBetweenQuats(q1,q2){
-  const dq = q1.clone().invert().multiply(q2);
-  return 2*Math.acos(THREE.MathUtils.clamp(dq.w, -1, 1));
-}
+    loader.load(MODEL_URL,(gltf)=>{
+      puzzleRoot=gltf.scene;
+      // reset any baked rotation/scales that could invert normals
+      puzzleRoot.rotation.set(0,0,0);
+      puzzleRoot.updateMatrixWorld(true);
 
-// ---------- Load GLB ----------
-const loader = new THREE.GLTFLoader();
-const GLB_URL = "puzzle_50_scattered.glb"; // placé à côté de ce fichier
-loader.load(GLB_URL, (gltf)=>{
-  const root = gltf.scene;
-  root.traverse(o=>{
-    if (o.isMesh){
-      // Suppose chaque pièce est un mesh distinct
-      o.castShadow = false;
-      o.receiveShadow = false;
-      // Ajoute au groupe puzzle
-      puzzleGroup.add(o);
-      pickableMeshes.push(o);
-      pieces.push({
-        name: o.name || ('piece_'+pieces.length),
-        mesh: o,
-        target: { position: o.position.clone(), quaternion: o.quaternion.clone() }, // fallback: position actuelle
-        placed: false
+      scene.add(puzzleRoot);
+
+      // collect pickable meshes & enforce FrontSide (avoid seeing backfaces)
+      pickableMeshes=[];
+      puzzleRoot.traverse(o=>{
+        if(o.isMesh){
+          pickableMeshes.push(o);
+          if(o.material){
+            const mats = Array.isArray(o.material) ? o.material : [o.material];
+            for(const m of mats){
+              if(m && m.side !== THREE.FrontSide) m.side = THREE.FrontSide;
+            }
+          }
+        }
       });
-    }
-  });
 
-  // BASCULE VERTICALE (face à l’utilisateur)
-  puzzleGroup.rotation.y = Math.PI;
-  puzzleGroup.rotation.x = 0;
-  puzzleGroup.rotation.z = 0;
+      // Fit camera to object (before any flip)
+      currentBBox=computePuzzleBBox(pickableMeshes);
+      frameFrontView(currentBBox);
 
-  // Centrer le group
-  const box = new THREE.Box3().setFromObject(puzzleGroup);
-  const center = new THREE.Vector3();
-  box.getCenter(center);
-  puzzleGroup.position.sub(center); // centre à l'origine
-  controls.target.set(0,0,0);
-  controls.update();
-
-  // Essaye de récupérer des cibles dédiées si elles existent dans le GLB
-  // - noeud "Targets" avec enfants nommés comme les pièces
-  const maybeTargets = root.getObjectByName('Targets') || root.getObjectByName('targets');
-  if (maybeTargets){
-    maybeTargets.traverse(t=>{
-      if (!t.isObject3D || t === maybeTargets) return;
-      const found = pieces.find(p=>p.name === t.name || p.name.replace(/^piece[_-]?/,'') === t.name.replace(/^target[_-]?/,''));
-      if (found){
-        found.target.position.copy(t.position);
-        found.target.quaternion.copy(t.quaternion);
+      // Ensure face-on: try X flip first (seen from behind vertically), then Y flip as fallback
+      if(!frontIsVisible(pickableMeshes)){
+        puzzleRoot.rotateX(Math.PI);
+        puzzleRoot.updateMatrixWorld(true);
+        if(!frontIsVisible(pickableMeshes)){
+          puzzleRoot.rotateX(-Math.PI); // revert X
+          puzzleRoot.rotateY(Math.PI);  // try Y
+          puzzleRoot.updateMatrixWorld(true);
+        }
       }
+
+      // Freeze transforms for stability
+      puzzleRoot.matrixAutoUpdate=false;
+
+      // Build root pieces (first level under root)
+      const rootSet=new Set();
+      for(const m of pickableMeshes){
+        let node=m; while(node.parent && node.parent!==puzzleRoot) node=node.parent;
+        rootSet.add(node);
+      }
+      const roots=[...rootSet];
+
+      // Targets (grid)
+      let fallbackIndexCounter=0;
+      const x0=-PUZZLE_W/2+CELL_W/2, y0=PUZZLE_H/2-CELL_H/2;
+      function parseRowColFromName(name=''){
+        const m=/r(\\d+)_c(\\d+)/i.exec(name);
+        return m?{r:+m[1],c:+m[2]}:null;
+      }
+      function computeTargetTransform(obj){
+        const rc=parseRowColFromName(obj.name);
+        if(rc){
+          return { position:new THREE.Vector3(x0+rc.c*CELL_W, y0-rc.r*CELL_H, 0),
+                   quaternion:new THREE.Quaternion() };
+        }
+        const idx=(fallbackIndexCounter++ % (ROWS*COLS));
+        const r=Math.floor(idx/COLS), c=idx%COLS;
+        return { position:new THREE.Vector3(x0+c*CELL_W, y0-r*CELL_H, 0),
+                 quaternion:new THREE.Quaternion() };
+      }
+      roots.forEach(root=>{
+        pieces.push({ mesh:root, target:computeTargetTransform(root), placed:false });
+      });
+
+      // Reframe (after flip) and finalize
+      currentBBox=computePuzzleBBox(pickableMeshes);
+      frameFrontView(currentBBox);
+      pieces.forEach(p=>p.target.position.z=0);
+      updatePlacedCounter();
+    }, undefined, (err)=>console.error('Erreur chargement GLB:', err));
+
+    const placedInfo=document.getElementById('placedInfo');
+    const audioEl=document.getElementById('snapSound');
+    let dragging=null, dragStartPos=null;
+
+    function getPoint(e){ return e.touches?.[0] || e.changedTouches?.[0] || e; }
+    function setPointer(x,y){
+      const rect=renderer.domElement.getBoundingClientRect();
+      pointer.x=((x-rect.left)/rect.width)*2-1;
+      pointer.y=-((y-rect.top)/rect.height)*2+1;
+    }
+    function findRootPiece(obj){
+      let node=obj; while(node.parent && node.parent!==puzzleRoot) node=node.parent;
+      return node;
+    }
+
+    function pointerDown(e){
+      e.preventDefault();
+      const { clientX, clientY } = getPoint(e);
+      setPointer(clientX, clientY);
+      raycaster.setFromCamera(pointer, camera);
+      const hits=raycaster.intersectObjects(pickableMeshes,true).filter(hit=>{
+        const root=findRootPiece(hit.object);
+        return root && !(root.userData && root.userData.locked);
+      });
+      if(!hits.length) return;
+      const rootMesh=findRootPiece(hits[0].object);
+      const entry=pieces.find(p=>p.mesh===rootMesh);
+      if(!entry) return;
+      dragging=entry; dragStartPos=entry.mesh.position.clone();
+      controls.enabled=false;
+      const pieceWorld=new THREE.Vector3(); entry.mesh.getWorldPosition(pieceWorld);
+      dragPlane=makeScreenDragPlane(camera,pieceWorld);
+      const worldHit=screenToWorldOnPlane(clientX,clientY,dragPlane,tmpV3);
+      const localHit=worldToParentLocal(entry.mesh,worldHit);
+      dragOffsetLocal.copy(entry.mesh.position).sub(localHit);
+    }
+    function pointerMove(e){
+      if(!dragging) return; e.preventDefault();
+      const { clientX, clientY } = getPoint(e);
+      const worldHit=screenToWorldOnPlane(clientX,clientY,dragPlane,tmpV3);
+      const localHit=worldToParentLocal(dragging.mesh,worldHit).add(dragOffsetLocal);
+      dragging.mesh.position.lerp(localHit, LERP_ALPHA_DRAG);
+      tryMagnet(dragging);
+    }
+    function pointerUp(e){
+      e.preventDefault();
+      if(dragging){
+        tryMagnet(dragging,true);
+        if(!dragging.placed && overlapsAny(dragging)){
+          dragging.mesh.position.copy(dragStartPos);
+        }
+        dragging=null;
+      }
+      controls.enabled=true;
+    }
+    function overlapsAny(entry){
+      const pos=entry.mesh.position;
+      for(const other of pieces){
+        if(other===entry) continue;
+        const d=pos.distanceTo(other.mesh.position);
+        if(d<MIN_CENTER_DIST) return true;
+      }
+      return false;
+    }
+    function angleBetweenQuats(a,b){
+      const dot=Math.abs(a.dot(b));
+      return Math.acos(Math.min(1,Math.max(-1,2*dot*dot-1)));
+    }
+    function tryMagnet(entry, final=false){
+      if(!entry || entry.placed) return;
+      const mesh=entry.mesh, tgt=entry.target;
+      const d=mesh.position.distanceTo(tgt.position);
+      if(d>CAPTURE_RADIUS) return;
+      mesh.position.lerp(tgt.position, LERP_ALPHA_SNAP);
+      const a=angleBetweenQuats(mesh.quaternion,tgt.quaternion);
+      if(a>SNAP_EPS_ROT) mesh.quaternion.slerp(tgt.quaternion, LERP_ALPHA_SNAP);
+      const close=d<SNAP_EPS_POS && a<SNAP_EPS_ROT;
+      if(close || final){
+        if(mesh.position.distanceTo(tgt.position)<2*SNAP_EPS_POS &&
+           angleBetweenQuats(mesh.quaternion,tgt.quaternion)<2*SNAP_EPS_ROT){
+          mesh.position.copy(tgt.position);
+          mesh.quaternion.copy(tgt.quaternion);
+          entry.placed=true;
+          if(LOCK_PLACED) mesh.userData.locked=true;
+          playSnap(); updatePlacedCounter();
+        }
+      }
+    }
+    function playSnap(){ if(!audioEl) return; try{ audioEl.currentTime=0; audioEl.play().catch(()=>{}); }catch{} }
+    function updatePlacedCounter(){
+      const n=pieces.filter(p=>p.placed).length;
+      placedInfo.textContent=`${n} / ${pieces.length || (ROWS*COLS)} placées`;
+    }
+
+    function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene,camera); }
+    animate();
+
+    window.addEventListener('resize', ()=>{
+      const w=window.innerWidth, h=window.innerHeight;
+      renderer.setSize(w,h);
+      camera.aspect=w/h; camera.updateProjectionMatrix();
+      if(currentBBox) frameFrontView(currentBBox);
     });
-  }
 
-  // UI
-  placedCount = 0;
-  placedEl.textContent = placedCount + " / " + pieces.length;
+    renderer.domElement.addEventListener('pointerdown',pointerDown,{passive:false});
+    window.addEventListener('pointermove', pointerMove,{passive:false});
+    window.addEventListener('pointerup',   pointerUp,  {passive:false});
+    renderer.domElement.addEventListener('touchstart',pointerDown,{passive:false});
+    window.addEventListener('touchmove',  pointerMove,{passive:false});
+    window.addEventListener('touchend',   pointerUp,  {passive:false});
 
-  animate();
-}, undefined, (err)=>{
-  console.error(err);
-  animate();
-});
-
-// ---------- Drag logic ----------
-let dragging = null, dragStartPos = null;
-let lastMoveT = 0;
-const dragOffsetLocal = new THREE.Vector3();
-const dragPlaneNormal = new THREE.Vector3();
-let dragPlane = null;
-const tmpV3 = new THREE.Vector3();
-const dragVel = new THREE.Vector3();
-
-function worldToParentLocal(mesh, world){
-  // world point expressed in parent's local space (mesh parent coordinates)
-  return mesh.parent.worldToLocal(world.clone());
-}
-
-function screenToWorldOnPlane(clientX, clientY, plane, out){
-  pointer.x =  (clientX / innerWidth) * 2 - 1;
-  pointer.y = -(clientY / innerHeight) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  const hit = new THREE.Vector3();
-  raycaster.ray.intersectPlane(plane, hit);
-  out.copy(hit);
-}
-
-function findRootPiece(o){
-  // In this file, the mesh itself is the draggable piece
-  while(o && !pickableMeshes.includes(o)){
-    o = o.parent;
-  }
-  return o;
-}
-
-function updatePlacedCounter(){
-  placedCount = pieces.reduce((a,p)=>a + (p.placed?1:0), 0);
-  placedEl.textContent = placedCount + " / " + pieces.length;
-}
-
-function playSnap(){
-  // Simple click via WebAudio (evite gestion de wav externe)
-  try{
-    const ac = playSnap.ctx || (playSnap.ctx = new (window.AudioContext||window.webkitAudioContext)());
-    const o = ac.createOscillator();
-    const g = ac.createGain();
-    o.type = 'square'; o.frequency.setValueAtTime(880, ac.currentTime);
-    g.gain.setValueAtTime(0.12, ac.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.08);
-    o.connect(g).connect(ac.destination);
-    o.start(); o.stop(ac.currentTime + 0.09);
-  }catch(e){}
-}
-
-function pointerDown(e){
-  e.preventDefault();
-  const pt = ('touches' in e)? e.touches[0] : e;
-  pointer.x =  (pt.clientX / innerWidth) * 2 - 1;
-  pointer.y = -(pt.clientY / innerHeight) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  const hits = raycaster.intersectObjects(pickableMeshes, true).filter(h=>{
-    const root = findRootPiece(h.object);
-    return root && !(root.userData && root.userData.locked);
-  });
-  if(!hits.length) return;
-
-  const rootMesh = findRootPiece(hits[0].object);
-  const entry = pieces.find(p => p.mesh === rootMesh);
-  if(!entry) return;
-
-  dragging = entry;
-  dragStartPos = entry.mesh.position.clone();
-  dragVel.set(0,0,0);
-  controls.enabled = false;
-
-  const worldPt = entry.mesh.getWorldPosition(new THREE.Vector3());
-  dragPlaneNormal.copy(camera.getWorldDirection(new THREE.Vector3()));
-  dragPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(dragPlaneNormal, worldPt);
-
-  screenToWorldOnPlane(pt.clientX, pt.clientY, dragPlane, tmpV3);
-  const localHit = worldToParentLocal(entry.mesh, tmpV3);
-  dragOffsetLocal.copy(entry.mesh.position).sub(localHit);
-
-  entry.mesh.position.z = 0.02;
-  lastMoveT = performance.now();
-}
-
-function pointerMove(e){
-  if(!dragging) return;
-  e.preventDefault();
-
-  const now = performance.now();
-  const dt  = Math.max(0.001, (now - lastMoveT) / 1000);
-  lastMoveT = now;
-
-  const pt = ('touches' in e)? e.touches[0] : e;
-  screenToWorldOnPlane(pt.clientX, pt.clientY, dragPlane, tmpV3);
-  const targetLocal = worldToParentLocal(dragging.mesh, tmpV3).add(dragOffsetLocal);
-
-  const want = targetLocal.clone().sub(dragging.mesh.position);
-  dragVel.addScaledVector(want, LERP_ALPHA_DRAG);
-  if (dragVel.length() / dt > MAX_DRAG_SPEED) {
-    dragVel.setLength(MAX_DRAG_SPEED * dt);
-  }
-  dragging.mesh.position.add(dragVel);
-
-  tryMagnet(dragging, false);
-}
-
-function pointerUp(e){
-  e.preventDefault();
-  if (dragging) {
-    tryMagnet(dragging, true);
-    if (!dragging.placed && overlapsAny(dragging)) {
-      dragging.mesh.position.copy(dragStartPos);
-    }
-    dragging.mesh.position.z = 0.0;
-    dragging = null;
-  }
-  controls.enabled = true;
-}
-
-function overlapsAny(entry){
-  const pos = entry.mesh.position;
-  for (const other of pieces){
-    if (other === entry) continue;
-    if (other.placed && LOCK_PLACED) continue;
-    if (pos.distanceTo(other.mesh.position) < MIN_CENTER_DIST) return true;
-  }
-  return false;
-}
-
-function tryMagnet(entry, final=false){
-  if(!entry || entry.placed) return;
-  const mesh = entry.mesh, tgt = entry.target;
-  const d = mesh.position.distanceTo(tgt.position);
-  const w = 1.0 - smoothstep(0, CAPTURE_RADIUS, d);
-  if (w > 0){
-    mesh.position.lerp(tgt.position, LERP_ALPHA_SNAP * w);
-    const a = angleBetweenQuats(mesh.quaternion, tgt.quaternion);
-    if (a > SNAP_EPS_ROT){
-      mesh.quaternion.slerp(tgt.quaternion, Math.max(0.35, LERP_ALPHA_SNAP * w));
-    }
-  }
-  const closePos = mesh.position.distanceTo(tgt.position) < (final ? 3*SNAP_EPS_POS : SNAP_EPS_POS);
-  const closeRot = angleBetweenQuats(mesh.quaternion, tgt.quaternion) < (final ? 3*SNAP_EPS_ROT : SNAP_EPS_ROT);
-
-  if (d < CAPTURE_RADIUS && closePos && closeRot){
-    mesh.position.copy(tgt.position);
-    mesh.quaternion.copy(tgt.quaternion);
-    entry.placed = true;
-    if (LOCK_PLACED) mesh.userData.locked = true;
-    playSnap();
-    updatePlacedCounter();
-  }
-}
-
-// ---------- Events ----------
-renderer.domElement.addEventListener('pointerdown', pointerDown, {passive:false});
-renderer.domElement.addEventListener('pointermove', pointerMove, {passive:false});
-renderer.domElement.addEventListener('pointerup', pointerUp, {passive:false});
-renderer.domElement.addEventListener('pointerleave', pointerUp, {passive:false});
-renderer.domElement.addEventListener('touchstart', pointerDown, {passive:false});
-renderer.domElement.addEventListener('touchmove', pointerMove, {passive:false});
-renderer.domElement.addEventListener('touchend', pointerUp, {passive:false});
-
-addEventListener('resize', ()=>{
-  camera.aspect = innerWidth/innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
-});
-
-// ---------- Loop ----------
-function animate(){
-  requestAnimationFrame(animate);
-  controls.update();
-  renderer.render(scene, camera);
-}
-</script>
+    const faceBtn=document.getElementById('faceBtn');
+    faceBtn.addEventListener('click', ()=> frameFrontView(currentBBox));
+    window.addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='f') frameFrontView(currentBBox); });
+  </script>
 </body>
 </html>
