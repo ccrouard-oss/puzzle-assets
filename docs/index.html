@@ -1,18 +1,14 @@
-
 <!doctype html>
 <html lang="fr">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-  <title>Puzzle 4:3 portrait — 2D stricte ➜ 3D sur demande</title>
+  <title>Puzzle – Déplacement fluide + aimantation robuste (v2)</title>
   <style>
     html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
     #app{position:fixed;inset:0}
-    .hud{
-      position:fixed;left:12px;top:12px;z-index:5;display:flex;gap:8px;flex-wrap:wrap;align-items:center;
-      background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);padding:8px 10px;border-radius:10px;backdrop-filter:blur(6px);
-      font-size:13px;line-height:1.35
-    }
+    .hud{position:fixed;left:12px;top:12px;z-index:5;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);
+      padding:8px 10px;border-radius:10px;backdrop-filter:blur(6px);font-size:13px;line-height:1.35;display:flex;gap:10px;align-items:center}
     .btn{cursor:pointer;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#e6edf3;padding:6px 10px;border-radius:8px;font-size:12px}
     .btn:hover{background:rgba(255,255,255,.12)}
     .badge{display:inline-block;padding:2px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.1)}
@@ -29,13 +25,14 @@
   <div id="app"></div>
 
   <div class="hud">
-    <span class="badge" id="mode">Mode: 2D</span>
-    <button id="faceBtn"    class="btn" title="Face 2D (F)">Face</button>
-    <button id="shuffleBtn" class="btn" title="Mélanger positions + orientations (0/90/180/270)">Mélanger</button>
-    <button id="resetBtn"   class="btn" title="Remettre chaque pièce sur la grille">Réinitialiser</button>
-    <button id="startBtn"   class="btn" title="Activer une 3D très limitée">Démarrer (3D)</button>
-    <span class="badge" id="infoBloc">Bloc: 1 pièce</span>
-    <span class="badge" id="infoPlaced">0 placées</span>
+    <div class="badge" id="mode">Mode: 2D</div>
+    <button id="startBtn" class="btn" title="Activer 3D limitée">Démarrer (3D)</button>
+    <button id="faceBtn" class="btn" title="Revenir face 2D (F)">Face</button>
+    <div class="badge" id="groupInfo">Bloc: 1 pièce</div>
+    <div class="badge" id="placedInfo">0 placées</div>
+    <label style="display:flex;gap:6px;align-items:center">
+      <input type="checkbox" id="lockAfterMerge" checked /> Verrouiller blocs assemblés
+    </label>
   </div>
 
   <audio id="snapSound" src="click.wav" preload="auto"></audio>
@@ -45,55 +42,51 @@
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-    // ===== Paramètres invariants (4:3 portrait, 2D stricte au démarrage) =====
-    const MODEL_URL = 'puzzle_50_scattered.glb';   // ton GLB
+    // ========= CONFIG (4:3 PORTRAIT, 2D PAR DÉFAUT) ==========================
+    const MODEL_URL = 'puzzle_50_scattered.glb';     // adapte si nécessaire
     const ROWS=5, COLS=10;
-    const PUZZLE_W=3.0, PUZZLE_H=4.0;              // 4:3 portrait (NE PAS CHANGER)
+    const PUZZLE_W=3.0, PUZZLE_H=4.0;                // 4:3 portrait
     const CELL_W=PUZZLE_W/COLS, CELL_H=PUZZLE_H/ROWS;
 
-    // Cadre de mélange: toutes les pièces doivent rester visibles
-    const BOUNDS_MARGIN = 0.7;                     // marge autour du puzzle
-    const MIX_W = PUZZLE_W + 2*BOUNDS_MARGIN;
-    const MIX_H = PUZZLE_H + 2*BOUNDS_MARGIN;
+    // — Fluide & aimantation
+    const POS_EPS = 0.003;
+    const LERP_DRAG = 0.35;        // plus doux qu'avant
+    const LERP_SNAP = 0.5;         // accélère la fin de course
 
-    // Magnétisme & déplacements
-    const SNAP_NEIGH_EAGER = 0.10;  // snap instantané si très proche
-    const SNAP_NEIGH       = 0.17;  // tolérance bloc↔bloc
-    const SNAP_GRID        = 0.20;  // tolérance position cible
-    const POS_EPS          = 0.0025;
-    const LERP_DRAG        = 0.70;  // suivi du pointeur
-    const LERP_SNAP        = 0.65;  // aimantation
+    // — Seuils d'aimantation
+    const SNAP_GRID = 0.18;        // capture sur la cible absolue
+    const SNAP_NEIGH_EAGER = 0.14; // aimantation immédiate (voisin exact)
+    const SNAP_NEIGH = 0.2;        // voisinage "proche" (drag continu)
 
-    // Anti-chevauchement
-    const COLLISION_PAD = 0.98;     // 1 = tangence, <1 autorise un léger recouvrement
-    const MAX_SEP_STEP  = 0.06;
-    const MIN_BLOCK_RADIUS = Math.min(CELL_W, CELL_H)*0.35;
+    // — Hystérésis (bandes collantes) pour éviter le papillotement post-snap
+    const STICKY_BAND = 0.25;      // garde l'accrochage si on bouge légèrement
 
-    // Profondeur / 3D (optionnelle)
-    const Z_LIMIT_2D = 0.0;
-    const Z_LIMIT_3D = 0.02;
-    const CAMERA_TILT_DEG = 6;
+    // Anti-chevauchement (distance minimale entre centres de blocs)
+    const MIN_CENTER_DIST = Math.min(CELL_W, CELL_H)*0.42;
 
-    // ===== Scène =====
+    // Profondeur limitée
+    const Z_LIMIT_2D = 0.0;      // 2D stricte
+    const Z_LIMIT_3D = 0.02;     // ±2 cm
+    const CAMERA_TILT_DEG = 6;   // tilt max en 3D
+
+    // Bornes XY
+    const BOUNDS_MARGIN = 0.6;
+
+    // ========= SCÈNE =========================================================
     const app = document.getElementById('app');
     const scene = new THREE.Scene(); scene.background = new THREE.Color('#0d1117');
-    let is3D = false;
 
-    // Caméra ORTHO (2D stricte) — active au démarrage
+    let is3D = false;
+    const ortho = makeOrtho();
     function makeOrtho(){
       const aspect = window.innerWidth / window.innerHeight;
-      const viewH = (PUZZLE_H + 2*BOUNDS_MARGIN) * 1.04;
+      const viewH = PUZZLE_H * 1.15;
       const viewW = viewH * aspect;
-      const cam = new THREE.OrthographicCamera(-viewW/2, viewW/2, viewH/2, -viewH/2, -10, 10);
-      cam.position.set(0,0,5); cam.lookAt(0,0,0);
-      return cam;
+      return new THREE.OrthographicCamera(-viewW/2, viewW/2, viewH/2, -viewH/2, -10, 10);
     }
-    const ortho = makeOrtho();
-    let camera = ortho;
-
-    // Caméra PERSPECTIVE (3D très limitée) — inactivée au départ
     const persp = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.01, 20);
     persp.position.set(0,0,6);
+    let camera = ortho;
 
     const renderer = new THREE.WebGLRenderer({antialias:true});
     renderer.setPixelRatio(Math.min(devicePixelRatio,2));
@@ -101,43 +94,33 @@
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     app.appendChild(renderer.domElement);
 
-    scene.add(new THREE.HemisphereLight(0xffffff,0x223344,0.85));
-    const dir = new THREE.DirectionalLight(0xffffff,0.6); dir.position.set(2,3,4); scene.add(dir);
+    scene.add(new THREE.HemisphereLight(0xffffff,0x223344,0.8));
+    const dl = new THREE.DirectionalLight(0xffffff,0.6); dl.position.set(2,3,4); scene.add(dl);
 
-    // Contrôles 3D (seulement quand activés)
     const controls = new OrbitControls(persp, renderer.domElement);
     controls.enableDamping = true; controls.dampingFactor = 0.08;
-    controls.enableRotate = false; controls.enablePan = true; controls.enableZoom = true;
+    controls.enableRotate = false; // activé uniquement en 3D
+    controls.enablePan = true; controls.enableZoom = true;
     controls.minDistance = 4.5; controls.maxDistance = 8.0;
     const tilt = THREE.MathUtils.degToRad(CAMERA_TILT_DEG);
-    controls.minPolarAngle = Math.PI/2 - tilt; controls.maxPolarAngle = Math.PI/2 + tilt;
+    controls.minPolarAngle = Math.PI/2 - tilt;
+    controls.maxPolarAngle = Math.PI/2 + tilt;
 
-    // Raycast / pointeur
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
-    function setPointer(e){
-      const p = e.touches?.[0] || e.changedTouches?.[0] || e;
-      const rect = renderer.domElement.getBoundingClientRect();
-      pointer.x=((p.clientX-rect.left)/rect.width)*2-1;
-      pointer.y=-((p.clientY-rect.top)/rect.height)*2+1;
-      return p;
-    }
 
-    // Données puzzle
     const puzzleRoot = new THREE.Group(); scene.add(puzzleRoot);
     const pickableMeshes = [];
-    const entries = [];            // {group, mesh, rc, target, placed}
-    const entryByKey = new Map();  // "rX_cY" -> entry
+    const entriesByName = new Map();
+    const entries = [];
 
     const x0 = -PUZZLE_W/2 + CELL_W/2;
     const y0 =  PUZZLE_H/2 - CELL_H/2;
     const targetOf = (rc)=> new THREE.Vector3(x0 + rc.c*CELL_W, y0 - rc.r*CELL_H, 0);
 
-    // ===== Chargement GLB (SANS réorientation — on respecte l'image 4:3 portrait) =====
     const loader = new GLTFLoader();
     loader.load(MODEL_URL, (gltf)=>{
       const root = gltf.scene;
-
       root.traverse(o=>{
         if(o.isMesh){
           pickableMeshes.push(o);
@@ -145,139 +128,106 @@
           for(const m of mats){ if(m){ m.side = THREE.FrontSide; } }
         }
       });
+      orientFaceOn(root);
 
-      // Chaque pièce = racine directe sous gltf.scene (pas de rotation forcée)
-      const roots = uniquePieceRoots(root);
-      for(const piece of roots){
-        const rc = parseRC(piece.name) || {r:0,c:0};
-        const block = wrapAsBlock(piece, puzzleRoot);
-        const entry = { group:block, mesh:piece, rc, target:targetOf(rc), placed:false };
+      for(const rNode of uniqueRootsUnder(root)){
+        const rc = parseRC(rNode.name) || {r:0,c:0};
+        const block = reparentAsBlock(rNode, puzzleRoot);
+        const entry = { group:block, mesh:rNode, rc, target:targetOf(rc), placed:false, stickyTo:null };
         entries.push(entry);
-        entryByKey.set(keyOf(rc), entry);
+        entriesByName.set(`r${rc.r}_c${rc.c}`, entry);
       }
 
-      // 2D stricte et mélange initial borné
-      planarZ(puzzleRoot, 0);
-      shuffleAllPieces(true);      // mélange positions + rotations (Z: 0/90/180/270) dans le cadre
-      frame2D();
+      forcePlanarZ(puzzleRoot, 0);
       updateHUD();
-    }, undefined, err=>console.error('GLB error:', err));
+      frame2D();
+    }, undefined, err=>console.error(err));
 
-    function uniquePieceRoots(root){
+    function orientFaceOn(root){
+      root.rotation.set(0,0,0);
+      root.updateMatrixWorld(true);
+      const bbox = new THREE.Box3().setFromObject(root);
+      if(bbox.getSize(new THREE.Vector3()).z > 0.2){
+        root.rotation.x = Math.PI/2;
+        root.updateMatrixWorld(true);
+      }
+    }
+    function uniqueRootsUnder(root){
       const set = new Set();
-      root.traverse(o=>{
-        if(o.isMesh){
-          let n=o; while(n.parent && n.parent!==root) n=n.parent;
-          set.add(n);
-        }
-      });
+      for(const m of pickableMeshes){
+        let n=m; while(n.parent && n.parent!==root) n=n.parent;
+        set.add(n);
+      }
       return [...set];
     }
-    function parseRC(name=''){ const m=/r(\d+)_c(\d+)/i.exec(name); return m?{r:+m[1],c:+m[2]}:null; }
-    function keyOf(rc){ return `r${rc.r}_c${rc.c}`; }
-
-    function wrapAsBlock(node, parent){
-      const block = new THREE.Group(); parent.add(block);
+    function parseRC(name=''){
+      const m = /r(\d+)_c(\d+)/i.exec(name);
+      return m? {r:+m[1], c:+m[2]} : null;
+    }
+    function reparentAsBlock(node, parent){
+      const block = new THREE.Group();
+      parent.add(block);
       node.updateMatrixWorld(true);
       const wp = new THREE.Vector3(); node.getWorldPosition(wp);
       const wq = new THREE.Quaternion(); node.getWorldQuaternion(wq);
       block.position.copy(wp); block.quaternion.copy(wq); block.scale.set(1,1,1);
-      block.add(node); node.position.set(0,0,0); node.quaternion.identity(); node.scale.set(1,1,1);
+      block.add(node);
+      node.position.set(0,0,0); node.quaternion.identity(); node.scale.set(1,1,1);
       return block;
     }
 
-    // ===== Utilitaires blocs / limites / collisions =====
-    function findBlock(g){ let n=g; while(n.parent && n.parent!==puzzleRoot) n=n.parent; return n||g; }
-    function blockMembers(block){ const r=findBlock(block); return entries.filter(e=>findBlock(e.group)===r); }
-    function blockBBox(block){ return new THREE.Box3().setFromObject(block); }
-    function blockRadius(block){
-      const size = blockBBox(block).getSize(new THREE.Vector3());
-      const rx = Math.max(size.x*0.5, MIN_BLOCK_RADIUS);
-      const ry = Math.max(size.y*0.5, MIN_BLOCK_RADIUS);
-      return Math.sqrt(rx*rx + ry*ry);
-    }
-    function clampZ(limit, z){ return Math.max(-limit, Math.min(limit, z)); }
-    function planarZ(root, z=0){ root.traverse(o=>{ if(o.position) o.position.z = z; }); }
+    // ======== DRAG/SNAP/COLLISION ===========================================
+    let dragging = null;
+    let dragOffset = new THREE.Vector3(); // conserve l'offset clic→centre pour un suivi sous curseur précis
+    const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1), 0); // z=0
 
-    function clampInMixArea(v){
-      const halfW = MIX_W/2, halfH = MIX_H/2;
+    function setPointer(e){
+      const p = e.touches?.[0] || e.changedTouches?.[0] || e;
+      const rect=renderer.domElement.getBoundingClientRect();
+      pointer.x=((p.clientX-rect.left)/rect.width)*2-1;
+      pointer.y=-((p.clientY-rect.top)/rect.height)*2+1;
+      return p;
+    }
+    function rayFromPointer(){
+      const r = new THREE.Ray();
+      if(camera.isOrthographicCamera){
+        const origin = new THREE.Vector3(pointer.x, pointer.y, 0).unproject(ortho);
+        const dir = new THREE.Vector3(0,0,-1).transformDirection(ortho.matrixWorld);
+        r.origin.copy(origin); r.direction.copy(dir);
+      }else{
+        raycaster.setFromCamera(pointer, persp);
+        r.copy(raycaster.ray);
+      }
+      return r;
+    }
+    function intersectPickable(){
+      (camera.isOrthographicCamera? raycaster.setFromCamera(pointer, camera) : raycaster.setFromCamera(pointer, persp));
+      const hits = raycaster.intersectObjects(pickableMeshes, true);
+      for(const h of hits){
+        const e = entryFromObject(h.object);
+        if(e) return {entry:e, hitPoint:h.point};
+      }
+      return null;
+    }
+    function entryFromObject(obj){
+      let n = obj;
+      while(n && n.parent && n.parent!==puzzleRoot) n = n.parent;
+      if(!n) return null;
+      return entries.find(e=>e.group===n) || null;
+    }
+    function findBlock(g){
+      let n=g; while(n.parent && n.parent!==puzzleRoot) n=n.parent;
+      return n||g;
+    }
+    function forcePlanarZ(root, z=0){ root.traverse(o=>{ if(o.position) o.position.z = z; }); }
+    function clampZ(limit, z){ return Math.max(-limit, Math.min(limit, z)); }
+    function clampInBounds(v){
+      const halfW = PUZZLE_W/2 + BOUNDS_MARGIN;
+      const halfH = PUZZLE_H/2 + BOUNDS_MARGIN;
       v.x = Math.max(-halfW, Math.min(halfW, v.x));
       v.y = Math.max(-halfH, Math.min(halfH, v.y));
     }
 
-    // ===== Mélange / Reset (positions + orientations multiples de 90° autour de Z) =====
-    function shuffleAllPieces(avoidOverlaps=false){
-      const angles = [0, Math.PI/2, Math.PI, 3*Math.PI/2];
-      // éclater d’éventuels blocs fusionnés
-      for(const e of entries){
-        const b = findBlock(e.group);
-        if(blockMembers(b).length>1) splitBlockToSingles(b);
-      }
-      for(const e of entries){
-        const g = e.group;
-        const rx = (Math.random()-0.5)*MIX_W;
-        const ry = (Math.random()-0.5)*MIX_H;
-        g.position.set(rx, ry, 0);
-        g.rotation.set(0,0, angles[Math.floor(Math.random()*angles.length)]);
-      }
-      planarZ(puzzleRoot, 0);
-      if(avoidOverlaps) separateOverlapsQuick(12);
-      updateHUD();
-    }
-
-    function splitBlockToSingles(block){
-      const members = blockMembers(block);
-      if(members.length<=1) return;
-      for(const e of members){
-        const single = new THREE.Group(); puzzleRoot.add(single);
-        const wp = new THREE.Vector3(); e.group.getWorldPosition(wp);
-        const wq = new THREE.Quaternion(); e.group.getWorldQuaternion(wq);
-        single.position.copy(wp); single.quaternion.copy(wq); single.scale.set(1,1,1);
-        // replacer le mesh correspondant sous single
-        let node = e.mesh; let top=node; while(top.parent && top.parent!==e.group) top=top.parent;
-        single.add(top); top.position.set(0,0,0); top.quaternion.identity(); top.scale.set(1,1,1);
-        e.group = single; e.placed = false;
-      }
-      puzzleRoot.remove(block);
-    }
-
-    function resetToGrid(){
-      // éclater les blocs et recaler chaque pièce sur sa cible (rotation = 0)
-      for(const e of entries){
-        const b = findBlock(e.group);
-        if(blockMembers(b).length>1) splitBlockToSingles(b);
-      }
-      for(const e of entries){
-        e.group.position.copy(e.target);
-        e.group.rotation.set(0,0,0);
-        e.placed = true;
-      }
-      planarZ(puzzleRoot, 0);
-      updateHUD();
-    }
-
-    function separateOverlapsQuick(passes=10){
-      for(let k=0;k<passes;k++){
-        for(const ea of entries){
-          const A = findBlock(ea.group); const cA = blockBBox(A).getCenter(new THREE.Vector3()); const rA = blockRadius(A);
-          for(const eb of entries){
-            const B = findBlock(eb.group); if(B===A) continue;
-            const cB = blockBBox(B).getCenter(new THREE.Vector3()); const rB = blockRadius(B);
-            const minD = (rA + rB) * 0.94; // un poil plus strict pour l’initial
-            const delta = new THREE.Vector3().subVectors(cA, cB); const d = delta.length();
-            if(d < minD && d > 1e-5){
-              const step = Math.min(minD - d, MAX_SEP_STEP);
-              delta.normalize().multiplyScalar(step*0.5);
-              A.position.add(delta); B.position.add(delta.multiplyScalar(-1));
-              clampInMixArea(A.position); clampInMixArea(B.position);
-              A.position.z=0; B.position.z=0;
-            }
-          }
-        }
-      }
-    }
-
-    // ===== Voisinage logique & Snap bloc↔bloc =====
     function neighRCs(rc){
       const list=[];
       if(rc.r>0)      list.push({r:rc.r-1,c:rc.c, dx:0,        dy:+CELL_H});
@@ -286,97 +236,138 @@
       if(rc.c<COLS-1) list.push({r:rc.r,  c:rc.c+1, dx:+CELL_W,dy:0});
       return list;
     }
+    function isIntendedNeighbor(entry, other){
+      const rc = entry.rc;
+      return neighRCs(rc).some(n => `r${n.r}_c${n.c}` === `r${other.rc.r}_c${other.rc.c}`);
+    }
 
-    function bestNeighborPairFor(blockA){
-      const memA = blockMembers(blockA);
-      let best=null;
-      for(const eA of memA){
-        const posA = blockA.position;
-        for(const n of neighRCs(eA.rc)){
-          const eB = entryByKey.get(keyOf({r:n.r,c:n.c})); if(!eB) continue;
-          const blockB = findBlock(eB.group); if(blockB===blockA) continue;
-          const posB = blockB.position;
-          const desired = new THREE.Vector3(n.dx, n.dy, 0);     // posB - posA attendu
-          const current = new THREE.Vector3().subVectors(posB, posA);
-          const dist = current.sub(desired).length();
-          if(best===null || dist < best.dist){
-            best = { entryA:eA, entryB:eB, blockB, desired, dist, posB };
+    // — anti-chevauchement (résolution douce)
+    function resolveCollisionsFor(entry, ignoreForSnap=false){
+      const A = findBlock(entry.group);
+      const posA = A.position;
+      for(const e of entries){
+        const B = findBlock(e.group);
+        if(B===A) continue;
+        if(!ignoreForSnap && isIntendedNeighbor(entry, e)) continue; // ne repousse pas un voisin logique
+        const posB = B.position;
+        const delta = new THREE.Vector3().subVectors(posA, posB);
+        const dist = delta.length();
+        if(dist < MIN_CENTER_DIST){
+          if(dist < 1e-6){
+            delta.set(Math.random()-0.5, Math.random()-0.5, 0).normalize().multiplyScalar(MIN_CENTER_DIST);
+          }else{
+            delta.multiplyScalar((MIN_CENTER_DIST - dist)/dist);
           }
+          posA.add(delta);
+          clampInBounds(posA);
+          posA.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, posA.z);
         }
       }
-      return best;
     }
 
-    const snd = document.getElementById('snapSound');
-    function playSnap(){ try{ snd.currentTime=0; snd.play().catch(()=>{});}catch{} }
-
-    // Aligne, remet le bloc à rotation Z=0, fusionne, garde z=0
-    function snapBlockToPair(blockA, pair, final){
-      const newPos = new THREE.Vector3().subVectors(pair.posB, pair.desired);
-      if(final || pair.dist < SNAP_NEIGH_EAGER) blockA.position.copy(newPos);
-      else blockA.position.lerp(newPos, LERP_SNAP);
-      blockA.position.z = 0;                    // 2D stricte
-      blockA.rotation.set(0,0,0);               // IMPORTANT: réinitialise l’orientation pour emboîter
-
-      const ok = blockA.position.distanceTo(newPos) < (final? 2*POS_EPS : 0.02);
-      if(ok){
-        blockA.position.copy(newPos); blockA.position.z = 0; blockA.rotation.set(0,0,0);
-        mergeBlocks(blockA, pair.blockB);
-        planarZ(findBlock(blockA), 0);
-        playSnap(); updateHUD();
-        return true;
-      }
-      return false;
-    }
-
-    function trySnapNeighborsBlock(block, final){
-      const pair = bestNeighborPairFor(block);
-      if(!pair) return false;
-      const within = final ? (pair.dist <= 2*POS_EPS) : (pair.dist <= SNAP_NEIGH);
-      if(!within) return false;
-      return snapBlockToPair(block, pair, final);
-    }
+    // — SNAP GRILLE
+    const audioEl = document.getElementById('snapSound');
+    function playSnap(){ try{ audioEl.currentTime=0; audioEl.play().catch(()=>{});}catch{} }
 
     function trySnapGrid(entry, final){
-      const block = findBlock(entry.group);
-      const d = block.position.distanceTo(entry.target);
+      const d = entry.group.position.distanceTo(entry.target);
       if(!final && d>SNAP_GRID) return false;
-
       const aim = entry.target.clone();
-      if(final || d < SNAP_NEIGH_EAGER) block.position.copy(aim);
-      else block.position.lerp(aim, LERP_SNAP);
-      block.position.z = 0; block.rotation.set(0,0,0);
+      if(final || d < SNAP_NEIGH_EAGER){ entry.group.position.copy(aim);} else { entry.group.position.lerp(aim, LERP_SNAP); }
+      entry.group.position.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, 0);
 
-      const ok = block.position.distanceTo(aim) < (final? 2*POS_EPS : 0.02);
+      const ok = entry.group.position.distanceTo(aim) < (final? 2*POS_EPS : 0.02);
       if(ok){
-        block.position.copy(aim); block.position.z = 0; block.rotation.set(0,0,0);
-        entry.placed = true;
-        planarZ(block, 0);
+        entry.group.position.copy(aim);
+        entry.group.position.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, 0);
+        entry.placed = true; entry.stickyTo = null; // sur grille: pas de voisin spécifique
+        forcePlanarZ(findBlock(entry.group), 0);
         playSnap(); updateHUD();
         return true;
       }
       return false;
     }
 
-    // Fusion solide
+    // — SNAP VOISINAGE avec scoring + hysteresis "sticky"
+    function trySnapNeighbors(entry, final){
+      const rc = entry.rc;
+      const posA = entry.group.position;
+
+      // 1) si on est déjà collé à un voisin, garder l'accrochage dans la STICKY_BAND
+      if(entry.stickyTo){
+        const { nbKey, desired } = entry.stickyTo;
+        const nb = entriesByName.get(nbKey);
+        if(nb){
+          const posB = nb.group.position;
+          const delta = new THREE.Vector3().subVectors(posB, posA);
+          const dist = delta.clone().sub(desired).length();
+          if(dist < STICKY_BAND){
+            const newPosA = new THREE.Vector3().subVectors(posB, desired);
+            if(final || dist < SNAP_NEIGH_EAGER){ posA.copy(newPosA);} else { posA.lerp(newPosA, LERP_SNAP); }
+            posA.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, 0);
+            // Pas de fusion répétée ici (déjà fusionné)
+            return true;
+          } else {
+            entry.stickyTo = null; // assez loin, on libère
+          }
+        } else {
+          entry.stickyTo = null;
+        }
+      }
+
+      // 2) choisir le MEILLEUR voisin (score = distance au placement désiré)
+      let best = null;
+      for(const n of neighRCs(rc)){
+        const nb = entriesByName.get(`r${n.r}_c${n.c}`);
+        if(!nb) continue;
+
+        const blockA = findBlock(entry.group);
+        const blockB = findBlock(nb.group);
+        if(blockA===blockB) continue;
+
+        const posB = nb.group.position;
+        const desired = new THREE.Vector3(n.dx, n.dy, 0);
+        const dist = new THREE.Vector3().subVectors(posB, posA).sub(desired).length();
+        if(best===null || dist < best.dist){ best = { nb, desired, dist, nbKey:`r${n.r}_c${n.c}` }; }
+      }
+      if(!best) return false;
+
+      const eager = best.dist < SNAP_NEIGH_EAGER;
+      const near  = best.dist < (final? 2*POS_EPS : SNAP_NEIGH);
+      if(eager || near){
+        const blockA = findBlock(entry.group);
+        const blockB = findBlock(best.nb.group);
+        const newPosA = new THREE.Vector3().subVectors(best.nb.group.position, best.desired);
+        if(eager || final){ posA.copy(newPosA);} else { posA.lerp(newPosA, LERP_SNAP); }
+        posA.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, 0);
+
+        mergeBlocks(blockA, blockB);
+        forcePlanarZ(findBlock(entry.group), 0);
+        entry.stickyTo = { nbKey: best.nbKey, desired: best.desired.clone() };
+        playSnap(); updateHUD();
+        return true;
+      }
+      return false;
+    }
+
     function mergeBlocks(A, B){
-      A=findBlock(A); B=findBlock(B);
       if(A===B) return;
       const parent = new THREE.Group(); puzzleRoot.add(parent);
+      const pa = new THREE.Vector3(); A.getWorldPosition(pa);
+      const pb = new THREE.Vector3(); B.getWorldPosition(pb);
+      parent.position.copy(pa.add(pb).multiplyScalar(0.5));
+      reparentKeepWorld(A, parent);
+      reparentKeepWorld(B, parent);
+      forcePlanarZ(parent, 0);
 
-      const ca = blockBBox(A).getCenter(new THREE.Vector3());
-      const cb = blockBBox(B).getCenter(new THREE.Vector3());
-      parent.position.copy(ca.add(cb).multiplyScalar(0.5));
-      reparentKeepWorld(A, parent); reparentKeepWorld(B, parent);
-
-      parent.rotation.set(0,0,0); planarZ(parent, 0);  // bloc fusionné strictement coplanaire & sans rotation
+      // Marque "lockable" le nouveau parent si option activée
+      parent.userData.locked = document.getElementById('lockAfterMerge').checked;
 
       for(const e of entries){
         const r = findBlock(e.group);
-        if(r===A || r===B || r===parent){ e.group = parent; }
+        if(r===A || r===B || r===parent){ e.group = parent; e.placed = true; }
       }
     }
-
     function reparentKeepWorld(child, newParent){
       const wp = new THREE.Vector3(); child.getWorldPosition(wp);
       const wq = new THREE.Quaternion(); child.getWorldQuaternion(wq);
@@ -387,111 +378,83 @@
       child.scale.set(1,1,1);
     }
 
-    // ===== Drag 2D robuste + anti-chevauchement doux =====
-    let dragging = null;
-    const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1), 0); // plan z=0
-
-    function intersectPickable(){
-      raycaster.setFromCamera(pointer, camera);
-      const hits = raycaster.intersectObjects(pickableMeshes, true);
-      for(const h of hits){
-        const e = entryFromObject(h.object);
-        if(e) return e;
-      }
-      return null;
-    }
-    function entryFromObject(obj){
-      let n=obj; while(n && n.parent && n.parent!==puzzleRoot) n=n.parent;
-      if(!n) return null;
-      return entries.find(e=>e.group===n) || null;
-    }
-
+    // ======== INPUTS =========================================================
     function pointerDown(e){
       e.preventDefault();
       setPointer(e);
-      const ePick = intersectPickable();
-      if(!ePick) return;
-      dragging = ePick;
-      controls.enabled = false; // pas de rotation caméra pendant drag
-    }
+      const pick = intersectPickable();
+      if(!pick) return;
+      const { entry, hitPoint } = pick;
+      const root = findBlock(entry.group);
+      if(root.userData.locked) return; // verrouillé après assemblage
 
+      dragging = entry;
+      controls.enabled = false;
+
+      // calculer l'offset entre le point touché et le centre du bloc (pour un suivi fidèle sous le curseur)
+      const center = root.position.clone();
+      dragOffset.copy(hitPoint.clone().sub(center));
+      dragOffset.z = 0; // reste en 2D
+    }
     function pointerMove(e){
       if(!dragging) return;
       e.preventDefault();
       setPointer(e);
 
-      raycaster.setFromCamera(pointer, camera);
+      const ray = rayFromPointer();
       const hit = new THREE.Vector3();
-      if(!raycaster.ray.intersectPlane(dragPlane, hit)) return;
+      if(!ray.intersectPlane(dragPlane, hit)) return;
 
-      const block = findBlock(dragging.group);
+      // applique offset et lissage
+      const pos = dragging.group.position;
+      const target = hit.sub(dragOffset);
+      pos.lerp(target, LERP_DRAG);
+      clampInBounds(pos);
+      pos.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, pos.z);
 
-      // 1) déplacer (2D stricte)
-      block.position.lerp(hit, LERP_DRAG);
-      clampInMixArea(block.position);
-      block.position.z = 0;
+      // 1) tentative d'aimantation VOISINAGE (avec scoring + hysteresis)
+      const snappedNeighbor = trySnapNeighbors(dragging, false);
+      if(snappedNeighbor) return;
 
-      // 2) snap bloc↔bloc prioritaire
-      if(trySnapNeighborsBlock(block, false)) return;
+      // 2) snap GRILLE (vers la cible absolue si très proche)
+      const snappedGrid = trySnapGrid(dragging, false);
+      if(snappedGrid) return;
 
-      // 3) snap grille (utile pour poser un grand bloc)
-      if(trySnapGrid(dragging, false)) return;
-
-      // 4) anti-chevauchement (une passe douce)
-      resolveCollisionsOnce(block);
+      // 3) sinon, collisions douces
+      resolveCollisionsFor(dragging, /*ignoreForSnap=*/false);
     }
-
     function pointerUp(e){
       if(!dragging) return;
       e.preventDefault();
-
-      const block = findBlock(dragging.group);
-      if(!trySnapNeighborsBlock(block, true)) trySnapGrid(dragging, true);
-      resolveCollisionsOnce(block);
-
+      // finales fermes
+      if(!trySnapNeighbors(dragging, true)) trySnapGrid(dragging, true);
       dragging = null;
       controls.enabled = is3D;
     }
 
-    function resolveCollisionsOnce(block){
-      const A = findBlock(block);
-      const cA = blockBBox(A).getCenter(new THREE.Vector3());
-      const rA = blockRadius(A);
-      for(const e of entries){
-        const B = findBlock(e.group); if(B===A) continue;
-        const cB = blockBBox(B).getCenter(new THREE.Vector3());
-        const rB = blockRadius(B);
-        const minD = (rA + rB) * COLLISION_PAD;
-        const delta = new THREE.Vector3().subVectors(cA, cB);
-        const d = delta.length();
-        if(d < minD && d > 1e-5){
-          const step = Math.min(minD - d, MAX_SEP_STEP);
-          delta.normalize().multiplyScalar(step);
-          A.position.add(delta);
-          clampInMixArea(A.position);
-          A.position.z = 0;
-          cA.add(delta);
-        }
-      }
-    }
-
-    // ===== HUD / Caméras / Render =====
-    const infoPlaced = document.getElementById('infoPlaced');
-    const infoBloc   = document.getElementById('infoBloc');
+    // ======== HUD / CAMÉRAS / RENDER ========================================
+    const placedInfo = document.getElementById('placedInfo');
+    const groupInfo  = document.getElementById('groupInfo');
     const modeInfo   = document.getElementById('mode');
 
     function updateHUD(){
       const nPlaced = entries.filter(e=>e.placed).length;
-      infoPlaced.textContent = `${nPlaced} placées`;
-      const blk = dragging ? findBlock(dragging.group) : null;
-      const n = blk ? blockMembers(blk).length : 1;
-      infoBloc.textContent = `Bloc: ${n} pièce${n>1?'s':''}`;
+      placedInfo.textContent = `${nPlaced} placées`;
+      const blk = dragging? findBlock(dragging.group) : null;
+      groupInfo.textContent = `Bloc: ${blk? countPieces(blk):1} pièce${(blk&&countPieces(blk)>1)?'s':''}`;
+    }
+    function countPieces(block){
+      let c=0; for(const e of entries){ if(findBlock(e.group)===findBlock(block)) c++; }
+      return c||1;
     }
 
-    function frame2D(){ camera = ortho; modeInfo.textContent='Mode: 2D'; planarZ(puzzleRoot, 0); }
+    function frame2D(){
+      camera = ortho; modeInfo.textContent = 'Mode: 2D';
+      ortho.position.set(0,0,5); ortho.lookAt(0,0,0);
+      forcePlanarZ(puzzleRoot, 0);
+    }
     function frame3D(){
-      camera = persp; modeInfo.textContent='Mode: 3D (limitée)';
-      // léger tilt global (le contenu reste coplanaire)
+      camera = persp; modeInfo.textContent = 'Mode: 3D limité';
       puzzleRoot.rotation.set(THREE.MathUtils.degToRad(4), THREE.MathUtils.degToRad(-3), 0);
       controls.update();
     }
@@ -501,19 +464,19 @@
 
     window.addEventListener('resize', ()=>{
       const aspect = window.innerWidth / window.innerHeight;
-      const viewH = (PUZZLE_H + 2*BOUNDS_MARGIN) * 1.04;
+      const viewH = PUZZLE_H * 1.15;
       const viewW = viewH * aspect;
-      ortho.left=-viewW/2; ortho.right=viewW/2; ortho.top=viewH/2; ortho.bottom=-viewH/2; ortho.updateProjectionMatrix();
+      ortho.left = -viewW/2; ortho.right = viewW/2; ortho.top = viewH/2; ortho.bottom = -viewH/2;
+      ortho.updateProjectionMatrix();
       persp.aspect = aspect; persp.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
     });
     window.addEventListener('keydown', (e)=>{ if(e.key.toLowerCase()==='f'){ is3D=false; controls.enableRotate=false; frame2D(); } });
 
-    // ===== Boutons =====
-    document.getElementById('faceBtn').addEventListener('click',  ()=>{ is3D=false; controls.enableRotate=false; frame2D(); });
-    document.getElementById('shuffleBtn').addEventListener('click', ()=>{ is3D=false; controls.enableRotate=false; frame2D(); shuffleAllPieces(true); });
-    document.getElementById('resetBtn').addEventListener('click',   ()=>{ is3D=false; controls.enableRotate=false; frame2D(); resetToGrid(); });
-    document.getElementById('startBtn').addEventListener('click',   ()=>{ is3D=true;  controls.enableRotate=true;  controls.enabled=true; frame3D(); });
+    // Boutons
+    document.getElementById('startBtn').addEventListener('click', ()=>{ is3D = true; controls.enableRotate = true; controls.enabled = true; frame3D(); });
+    document.getElementById('faceBtn').addEventListener('click', ()=>{ is3D = false; controls.enableRotate=false; frame2D(); });
+
   </script>
 </body>
 </html>
