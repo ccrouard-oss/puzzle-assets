@@ -430,83 +430,82 @@
       forcePlanarZ(puzzleRoot, 0);
     }
 
-    // ========= INPUTS / RENDER ==============================================
-    let dragging = null;
-    let dragOffset = new THREE.Vector3();
-    const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1), 0);
+// ========= INPUTS / RENDER ==============================================
 
-    function pointerDown(e){
-      e.preventDefault();
-      setPointer(e);
-      const pick = intersectPickable();
-      if(!pick) return;
-      const { entry, hitPoint } = pick;
-      const root = findBlock(entry.group);
-      if(root.userData.locked) return;
-      dragging = entry;
-      const center = root.position.clone();
-      dragOffset.copy(hitPoint.clone().sub(center));
-      dragOffset.z = 0;
-    }
-    function pointerMove(e){
-      if(!dragging) return;
-      e.preventDefault();
-      setPointer(e);
-      const ray = rayFromPointer();
-      const hit = new THREE.Vector3();
-      if(!ray.intersectPlane(dragPlane, hit)) return;
+// (déclarations déjà faites plus haut, on ne les répète pas)
 
-      const pos = dragging.group.position;
-      const target = hit.sub(dragOffset);
-      pos.lerp(target, LERP_DRAG);
-      clampInBounds(pos);
+function pointerDown(e){
+  e.preventDefault();
+  setPointer(e);
+  const pick = intersectPickable();
+  if(!pick) return;
+  const { entry, hitPoint } = pick;
+  const root = findBlock(entry.group);
+  if(root.userData.locked) return;
+  dragging = entry;
+  const center = root.position.clone();
+  dragOffset.copy(hitPoint.clone().sub(center));
+  dragOffset.z = 0;
+}
 
-      if(trySnapNeighbors(dragging, false)) return;
-      if(trySnapGrid(dragging, false)) return;
+function pointerMove(e){
+  if(!dragging) return;
+  e.preventDefault();
+  setPointer(e);
+  const ray = rayFromPointer();
+  const hit = new THREE.Vector3();
+  if(!ray.intersectPlane(dragPlane, hit)) return;
 
-      resolveCollisionsFor(dragging, false);
-    }
-    function pointerUp(e){
-      if(!dragging) return;
-      e.preventDefault();
-      if(!trySnapNeighbors(dragging, true)) trySnapGrid(dragging, true);
-      dragging = null;
-      // ❌ NE PAS recadrer la caméra : on conserve le portrait figé centré
-    }
+  const pos = dragging.group.position;
+  const target = hit.sub(dragOffset);
+  pos.lerp(target, LERP_DRAG);
+  clampInBounds(pos);
 
-    const placedInfo = document.getElementById('placedInfo');
-    const groupInfo  = document.getElementById('groupInfo');
+  if(trySnapNeighbors(dragging, false)) return;
+  if(trySnapGrid(dragging, false)) return;
 
-    function updateHUD(){
-      const nPlaced = entries.filter(e=>e.placed).length;
-      placedInfo.textContent = `${nPlaced} placées`;
-      const blk = dragging? findBlock(dragging.group) : null;
-      const count = blk? countPieces(blk):1;
-      groupInfo.textContent = `Bloc: ${count} pièce${count>1?'s':''}`;
-    }
-    function countPieces(block){
-      let c=0; for(const e of entries){ if(findBlock(e.group)===findBlock(block)) c++; }
-      return c||1;
-    }
+  resolveCollisionsFor(dragging, false);
+}
 
-    function render(){ requestAnimationFrame(render); updateHUD(); renderer.render(scene, camera); }
+function pointerUp(e){
+  if(!dragging) return;
+  e.preventDefault();
+  if(!trySnapNeighbors(dragging, true)) trySnapGrid(dragging, true);
+  dragging = null;
+}
 
-    // Resize → on adapte le frustum mais on garde le portrait centré
-    window.addEventListener('resize', ()=>{
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      setPortraitView();
-    });
+const placedInfo = document.getElementById('placedInfo');
+const groupInfo  = document.getElementById('groupInfo');
 
-    // Bouton "Mélanger" : centré, sans chevauchement, pas de recadrage caméra
-    document.getElementById('shuffleBtn').addEventListener('click', ()=>{
-      shufflePieces();
-      updateHUD();
-    });
+function updateHUD(){
+  const nPlaced = entries.filter(e=>e.placed).length;
+  placedInfo.textContent = `${nPlaced} placées`;
+  const blk = dragging? findBlock(dragging.group) : null;
+  const count = blk? countPieces(blk):1;
+  groupInfo.textContent = `Bloc: ${count} pièce${count>1?'s':''}`;
+}
 
-    // Inputs
-    renderer.domElement.addEventListener('pointerdown', pointerDown, {passive:false});
-    renderer.domElement.addEventListener('pointermove', pointerMove, {passive:false});
-    window.addEventListener('pointerup', pointerUp, {passive:false});
+function countPieces(block){
+  let c=0; for(const e of entries){ if(findBlock(e.group)===findBlock(block)) c++; }
+  return c||1;
+}
+
+function render(){ requestAnimationFrame(render); updateHUD(); renderer.render(scene, camera); }
+
+window.addEventListener('resize', ()=>{
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  setPortraitView();
+});
+
+document.getElementById('shuffleBtn').addEventListener('click', ()=>{
+  shufflePieces();
+  updateHUD();
+});
+
+renderer.domElement.addEventListener('pointerdown', pointerDown, {passive:false});
+renderer.domElement.addEventListener('pointermove', pointerMove, {passive:false});
+window.addEventListener('pointerup', pointerUp, {passive:false});
+
   </script>
 </body>
 </html>
