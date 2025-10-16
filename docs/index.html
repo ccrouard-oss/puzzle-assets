@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Puzzle – 2D d'abord, 3D au démarrage</title>
+  <style>
+    html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}
+    #app{position:fixed;inset:0}
+    .hud{position:fixed;left:12px;top:12px;z-index:5;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);
+      padding:8px 10px;border-radius:10px;backdrop-filter:blur(6px);font-size:13px;line-height:1.35;display:flex;gap:10px;align-items:center}
+    .hud b{color:#fff;}
+    .badge{display:inline-block;padding:2px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.1);}
+    .btn{cursor:pointer;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#e6edf3;
+      padding:6px 10px;border-radius:8px;font-size:12px}
+    .btn:hover{background:rgba(255,255,255,.12)}
+    canvas{display:block; touch-action:none;}
+  </style>
+  <script type="importmap">
+    { "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    } }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div class="hud">
+    <div><b>Puzzle</b> – 2D ➜ 3D on start</div>
+    <div class="badge" id="groupInfo">Bloc: 1 pièce</div>
+    <div class="badge" id="placedInfo">0 placées</div>
+    <button id="startBtn" class="btn" title="Activer la rotation 3D">Démarrer (3D)</button>
+    <button id="faceBtn" class="btn" title="Recadrer face (touche F)">Face</button>
+  </div>
+
+  <audio id="snapSound" src="click.wav" preload="auto"></audio>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+    // === CONFIG ===============================================================
+    const MODEL_URL = 'puzzle_50_scattered.glb'; // adapte si besoin
+    const ROWS=5, COLS=10;
+    const PUZZLE_W=3.0, PUZZLE_H=4.0;
+    const CELL_W=PUZZLE_W/COLS, CELL_H=PUZZLE_H/ROWS;
+
+    // Snap à la grille (position cible) :
+    const CAPTURE_RADIUS_GRID = 0.20;
+    // Snap pièce↔pièce / bloc↔bloc (voisinage) :
+    const CAPTURE_RADIUS_NEIGH = 0.18;
+    const POS_EPS = 0.003, ROT_EPS = 0.002;
+    const LERP_DRAG = 0.6, LERP_SNAP = 0.35;
+
+    // Empêcher les centres de pièces de se chevaucher :
+    const MIN_CENTER_DIST = Math.min(CELL_W, CELL_H)*0.18;
+
+    // === SCÈNE ===============================================================
+    const app = document.getElementById('app');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#0d1117');
+
+    // Caméra perspective (face-on) + rotation désactivée au départ
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.01, 100);
+    camera.position.set(0,0,6);
+    const renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    app.appendChild(renderer.domElement);
+
+    // Lumières
+    scene.add(new THREE.HemisphereLight(0xffffff,0x334466,0.7));
+    const dir = new THREE.DirectionalLight(0xffffff,0.8); dir.position.set(2,3,4); scene.add(dir);
+
+    // Contrôles : 2D par défaut (pas de rotation)
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true; controls.dampingFactor = 0.08;
+    controls.enableRotate = false;   // ➜ 3D activée plus tard
+    controls.enablePan = true;
+    controls.enableZoom = true;
+
+    // Raycast & utilitaires pointeur
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    const tmpV3 = new THREE.Vector3();
+    const dragOffsetLocal = new THREE.Vector3();
+    let dragPlane = null;
+
+    function setPointerFromEvent(e){
+      const p = e.touches?.[0] || e.changedTouches?.[0] || e;
+      const rect=renderer.domElement.getBoundingClientRect();
+      pointer.x=((p.clientX-rect.left)/rect.width)*2-1;
+      pointer.y=-((p.clientY-rect.top)/rect.height)*2+1;
+      return p;
+    }
+    function worldOnScreenPlane(clientX,clientY,plane,out){
+      const rect=renderer.domElement.getBoundingClientRect();
+      pointer.x=((clientX-rect.left)/rect.width)*2-1;
+      pointer.y=-((clientY-rect.top)/rect.height)*2+1;
+      raycaster.setFromCamera(pointer,camera);
+      raycaster.ray.intersectPlane(plane,out);
+      return out;
+    }
+    function makeScreenDragPlane(cam, worldPoint){
+      const n = cam.getWorldDirection(new THREE.Vector3());
+      return new THREE.Plane().setFromNormalAndCoplanarPoint(n, worldPoint);
+    }
+    function keepPlanarZ0(obj){
+      // force z=0 pour l'objet ET sa hiérarchie
+      obj.traverse(o=>{
+        if (o.position) o.position.z = 0;
+      });
+    }
+
+    // === CHARGEMENT GLB & STRUCTURES =========================================
+    const loader = new GLTFLoader();
+    const puzzleRoot = new THREE.Group(); // contiendra des Group "blocs"
+    scene.add(puzzleRoot);
+
+    const pickableMeshes = [];
+    const entriesByName = new Map(); // "rX_cY" -> entry
+    const entries = [];              // toutes les pièces (entry = {group, mesh, rc, target})
+
+    const x0 = -PUZZLE_W/2 + CELL_W/2;
+    const y0 =  PUZZLE_H/2 - CELL_H/2;
+
+    function parseRowCol(name=''){
+      const m = /r(\d+)_c(\d+)/i.exec(name);
+      return m? {r:+m[1], c:+m[2]} : null;
+    }
+    function targetOf(rc){
+      return new THREE.Vector3(
+        x0 + rc.c*CELL_W,
+        y0 - rc.r*CELL_H,
+        0
+      );
+    }
+    function computeBBox(objs){
+      const b = new THREE.Box3();
+      objs.forEach(o=>b.expandByObject(o));
+      return b;
+    }
+    function frameFront(bbox){
+      if(!bbox) return;
+      const size = new THREE.Vector3(); bbox.getSize(size);
+      const center = bbox.getCenter(new THREE.Vector3());
+      const maxDim = Math.max(size.x,size.y);
+      const dist=(maxDim*0.6)/Math.tan(THREE.MathUtils.degToRad(camera.fov/2));
+      camera.position.set(center.x, center.y, dist);
+      camera.lookAt(center);
+      controls.target.copy(center);
+      controls.update();
+    }
+
+    // Détermine si l’on voit la "bonne face"
+    function frontIsVisible(meshes){
+      if(!meshes.length) return true;
+      const bbox = computeBBox(meshes);
+      const center = bbox.getCenter(new THREE.Vector3());
+      const dir = new THREE.Vector3().subVectors(center, camera.position).normalize();
+      raycaster.set(camera.position.clone(), dir);
+      const hits = raycaster.intersectObjects(meshes, true);
+      if(!hits.length) return true;
+      const hit = hits[0];
+      const nLocal = hit.face?.normal?.clone() || new THREE.Vector3(0,0,1);
+      const nMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
+      const nWorld = nLocal.applyMatrix3(nMatrix).normalize();
+      const surfaceToCam = new THREE.Vector3().subVectors(camera.position, hit.point).normalize();
+      return nWorld.dot(surfaceToCam) > 0;
+    }
+
+    loader.load(MODEL_URL, (gltf)=>{
+      const root = gltf.scene;
+      // Assainir
+      root.rotation.set(0,0,0); root.updateMatrixWorld(true);
+
+      // Collecter les meshes & forcer FrontSide
+      root.traverse(o=>{
+        if(o.isMesh){
+          pickableMeshes.push(o);
+          const mats = Array.isArray(o.material)? o.material : [o.material];
+          for(const m of mats){ if(m && m.side !== THREE.FrontSide) m.side = THREE.FrontSide; }
+        }
+      });
+
+      // Recadrage face
+      const bbox = computeBBox(pickableMeshes);
+      frameFront(bbox);
+
+      // Si vu par l’arrière, retourner
+      if(!frontIsVisible(pickableMeshes)){
+        root.rotateX(Math.PI);
+        root.updateMatrixWorld(true);
+        if(!frontIsVisible(pickableMeshes)){
+          root.rotateX(-Math.PI);
+          root.rotateY(Math.PI);
+          root.updateMatrixWorld(true);
+        }
+      }
+
+      // Construire une "pièce" = Group (bloc) qui contient son mesh racine
+      // On identifie les racines de pièce (niveau juste sous gltf.scene)
+      const rootSet = new Set();
+      pickableMeshes.forEach(m=>{
+        let n=m; while(n.parent && n.parent!==root) n=n.parent;
+        rootSet.add(n);
+      });
+      const pieceRoots = [...rootSet];
+
+      pieceRoots.forEach((rNode)=>{
+        // Crée un bloc indépendant (THREE.Group) sous puzzleRoot
+        const block = new THREE.Group();
+        puzzleRoot.add(block);
+
+        // Reparenter rNode -> block (en conservant la transform monde)
+        rNode.updateMatrixWorld(true);
+        const worldPos = new THREE.Vector3(); rNode.getWorldPosition(worldPos);
+        const worldQuat = new THREE.Quaternion(); rNode.getWorldQuaternion(worldQuat);
+        const worldScale = new THREE.Vector3(); rNode.getWorldScale(worldScale);
+
+        // Mettre rNode sous notre block
+        block.add(rNode);
+        block.position.copy(worldPos);
+        block.quaternion.copy(worldQuat);
+        block.scale.copy(worldScale);
+        rNode.position.set(0,0,0);
+        rNode.quaternion.identity();
+        rNode.scale.set(1,1,1);
+
+        // Trouver rc via le nom
+        const rc = parseRowCol(rNode.name) || {r:0,c:0};
+        // Cible (grille)
+        const tgt = targetOf(rc);
+
+        // Enregistrer l’entrée
+        const entry = { group:block, mesh:rNode, rc, target:tgt.clone(), placed:false };
+        entries.push(entry);
+        entriesByName.set(`r${rc.r}_c${rc.c}`, entry);
+      });
+
+      // Tout à z=0
+      keepPlanarZ0(puzzleRoot);
+
+      // Info initiale
+      updatePlacedInfo();
+      updateGroupInfo(1);
+    }, undefined, (err)=>console.error('Erreur GLB:', err));
+
+    // === DRAG & SNAP ==========================================================
+    let dragging = null;          // entry du bloc en drag (entry.group)
+    let dragStartPos = null;
+
+    function findEntryFromObject(obj){
+      // remonter jusqu’au Group bloc (enfant direct de puzzleRoot)
+      let n = obj;
+      while(n && n.parent && n.parent!==puzzleRoot) n = n.parent;
+      if(!n) return null;
+      return entries.find(e=>e.group===n) || null;
+    }
+
+    function intersectPickable(){
+      raycaster.setFromCamera(pointer,camera);
+      const hits = raycaster.intersectObjects(pickableMeshes, true);
+      if(!hits.length) return null;
+      // Prendre le premier hit dont le bloc n’est pas "verrouillé final"
+      for(const h of hits){
+        const e = findEntryFromObject(h.object);
+        if(e && !(e.group.userData && e.group.userData.finalLocked)) return e;
+      }
+      return null;
+    }
+
+    function pointerDown(e){
+      e.preventDefault();
+      const p = setPointerFromEvent(e);
+      const entry = intersectPickable();
+      if(!entry) return;
+
+      dragging = entry;
+      dragStartPos = entry.group.position.clone();
+      controls.enabled = false;
+
+      // Plan d’entraînement = plan écran passant par la position du bloc
+      const worldPoint = entry.group.getWorldPosition(new THREE.Vector3());
+      dragPlane = makeScreenDragPlane(camera, worldPoint);
+      // Décalage local pour une sensation douce
+      const worldHit = worldOnScreenPlane(p.clientX,p.clientY,dragPlane,tmpV3);
+      const localHit = entry.group.parent.worldToLocal(worldHit.clone());
+      dragOffsetLocal.copy(entry.group.position).sub(localHit);
+    }
+
+    function pointerMove(e){
+      if(!dragging) return;
+      e.preventDefault();
+      const p = setPointerFromEvent(e);
+      const worldHit = worldOnScreenPlane(p.clientX,p.clientY,dragPlane,tmpV3);
+      const localHit = dragging.group.parent.worldToLocal(worldHit.clone()).add(dragOffsetLocal);
+
+      // Mouvement atténué + maintien dans le plan
+      dragging.group.position.lerp(localHit, LERP_DRAG);
+      dragging.group.position.z = 0;
+
+      // Magnétisme voisinage (bloc↔bloc) d’abord
+      trySnapToNeighbors(dragging, false);
+      // Magnétisme grille (placement absolu)
+      trySnapToGrid(dragging, false);
+
+      // Éviter recouvrement de centres
+      if(overlapsAny(dragging)){
+        dragging.group.position.copy(dragStartPos);
+        dragging.group.position.z = 0;
+      }
+    }
+
+    function pointerUp(e){
+      e.preventDefault();
+      if(dragging){
+        // Tentatives finales
+        if(!trySnapToNeighbors(dragging, true)){
+          trySnapToGrid(dragging, true);
+        }
+        dragging = null;
+      }
+      controls.enabled = controls.enableRotate; // si 3D active, réactiver les contrôles
+    }
+
+    function overlapsAny(entry){
+      const pos = entry.group.position;
+      for(const other of entries){
+        if(other===entry) continue;
+        const d = pos.distanceTo(other.group.position);
+        if(d < MIN_CENTER_DIST) return true;
+      }
+      return false;
+    }
+
+    function angleBetweenQuats(a,b){
+      const dot=Math.abs(a.dot(b));
+      return Math.acos(Math.min(1,Math.max(-1,2*dot*dot-1)));
+    }
+
+    // --- Snap to GRID (position cible absolue) -------------------------------
+    function trySnapToGrid(entry, final){
+      const d = entry.group.position.distanceTo(entry.target);
+      if(d > CAPTURE_RADIUS_GRID && !final) return false;
+
+      // interpolation douce
+      entry.group.position.lerp(entry.target, LERP_SNAP);
+      entry.group.position.z = 0;
+
+      // On suppose rotation cible nulle (face-on). Si tes pièces ont une rot cible, adapte ici.
+      const close = entry.group.position.distanceTo(entry.target) < POS_EPS;
+      if(close || final){
+        if(entry.group.position.distanceTo(entry.target) < 2*POS_EPS){
+          entry.group.position.copy(entry.target);
+          entry.group.position.z = 0;
+          entry.placed = true;
+          keepPlanarZ0(entry.group);
+          playSnap();
+          updatePlacedInfo();
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // --- Snap pièce/bloc → voisin correct (selon row/col) -------------------
+    function neighborRCs(rc){
+      const list = [];
+      if(rc.r>0)         list.push({r:rc.r-1,c:rc.c,   rel:new THREE.Vector3(0, +CELL_H, 0)}); // au-dessus
+      if(rc.r<ROWS-1)    list.push({r:rc.r+1,c:rc.c,   rel:new THREE.Vector3(0, -CELL_H, 0)}); // en-dessous
+      if(rc.c>0)         list.push({r:rc.r,  c:rc.c-1, rel:new THREE.Vector3(-CELL_W, 0, 0)}); // gauche
+      if(rc.c<COLS-1)    list.push({r:rc.r,  c:rc.c+1, rel:new THREE.Vector3(+CELL_W, 0, 0)}); // droite
+      return list;
+    }
+
+    function trySnapToNeighbors(entry, final){
+      let snapped = false;
+      const rc = entry.rc;
+      const cand = neighborRCs(rc);
+
+      // Position monde actuelle du bloc dragué
+      const posA = entry.group.getWorldPosition(new THREE.Vector3());
+
+      for(const n of cand){
+        const key = `r${n.r}_c${n.c}`;
+        const neigh = entriesByName.get(key);
+        if(!neigh) continue;
+
+        // Si déjà même bloc, inutile
+        if(findBlockRoot(entry.group) === findBlockRoot(neigh.group)) continue;
+
+        // Position monde du voisin
+        const posB = neigh.group.getWorldPosition(new THREE.Vector3());
+        // Delta attendu (depuis A vers B) = (targetB - targetA)
+        const desired = new THREE.Vector3().subVectors(neigh.target, entry.target);
+
+        // Delta courant (depuis A vers B)
+        const current = new THREE.Vector3().subVectors(posB, posA);
+
+        // L’écart entre delta courant et delta attendu détermine l’emboîtement
+        const gap = current.clone().sub(desired);
+        const dist = gap.length();
+
+        if(dist < (final ? 2*POS_EPS : CAPTURE_RADIUS_NEIGH)){
+          // Caler A par rapport à B (et/ou inverse) pour respecter exactement le delta attendu
+          const newPosA = new THREE.Vector3().subVectors(posB, desired);
+          entry.group.position.lerp(newPosA, LERP_SNAP);
+          entry.group.position.z = 0;
+
+          // Check serré si final
+          const ok = entry.group.position.distanceTo(newPosA) < (final ? 2*POS_EPS : 0.02);
+          if(ok || final){
+            entry.group.position.copy(newPosA);
+            entry.group.position.z = 0;
+
+            // Fusionner blocs : entry.group + neigh.group -> un seul bloc solidaire
+            mergeBlocks(entry.group, neigh.group);
+            keepPlanarZ0(findBlockRoot(entry.group));
+            playSnap();
+            updateGroupInfo(countPiecesInBlock(findBlockRoot(entry.group)));
+            snapped = true;
+            break;
+          }
+        }
+      }
+      return snapped;
+    }
+
+    // --- Gestion des blocs (fusion solidaire) --------------------------------
+    function findBlockRoot(g){
+      // Le "bloc" est un enfant direct de puzzleRoot ; si g est déjà imbriqué, remonte
+      let n=g; while(n.parent && n.parent!==puzzleRoot) n=n.parent;
+      return n || g;
+    }
+
+    function mergeBlocks(a, b){
+      const A = findBlockRoot(a), B = findBlockRoot(b);
+      if(A===B) return;
+
+      // Créer un nouveau bloc parent et y rebrancher A et B en préservant les transforms monde
+      const newBlock = new THREE.Group();
+      puzzleRoot.add(newBlock);
+
+      // Poser newBlock au milieu entre A et B (pour minimiser déplacements)
+      const posA = new THREE.Vector3(); A.getWorldPosition(posA);
+      const posB = new THREE.Vector3(); B.getWorldPosition(posB);
+      const mid  = new THREE.Vector3().addVectors(posA, posB).multiplyScalar(0.5);
+      newBlock.position.copy(mid);
+      newBlock.quaternion.identity();
+      newBlock.scale.set(1,1,1);
+
+      reparentPreserveWorld(A, newBlock);
+      reparentPreserveWorld(B, newBlock);
+
+      // Mettre à z=0 tout le bloc fusionné
+      keepPlanarZ0(newBlock);
+
+      // Marquer toutes les entries de A et B avec ce nouveau group
+      for(const e of entries){
+        const r = findBlockRoot(e.group);
+        if(r===A || r===B || r===newBlock){
+          e.group = newBlock;
+        }
+      }
+    }
+
+    function reparentPreserveWorld(child, newParent){
+      const worldPos = new THREE.Vector3(); child.getWorldPosition(worldPos);
+      const worldQuat = new THREE.Quaternion(); child.getWorldQuaternion(worldQuat);
+      const worldScale = new THREE.Vector3(); child.getWorldScale(worldScale);
+
+      newParent.add(child);
+      // Déduire la transform locale depuis la transform monde
+      child.position.copy(child.parent.worldToLocal(worldPos.clone()));
+      const invParentQuat = child.parent.getWorldQuaternion(new THREE.Quaternion()).invert();
+      child.quaternion.copy(invParentQuat.multiply(worldQuat));
+      // NB: pour une hiérarchie simple, on garde scale=1 sur les sous-noeuds
+      child.scale.set(1,1,1);
+    }
+
+    function countPiecesInBlock(block){
+      let count = 0;
+      for(const e of entries){
+        if(findBlockRoot(e.group)===findBlockRoot(block)) count++;
+      }
+      return count;
+    }
+
+    // === HUD & SON ===========================================================
+    const groupInfo = document.getElementById('groupInfo');
+    const placedInfo = document.getElementById('placedInfo');
+    const audioEl = document.getElementById('snapSound');
+
+    function updatePlacedInfo(){
+      const n = entries.filter(e=>e.placed).length;
+      placedInfo.textContent = `${n} placées`;
+    }
+    function updateGroupInfo(n){
+      groupInfo.textContent = `Bloc: ${n} ${n>1?'pièces':'pièce'}`;
+    }
+    function playSnap(){ try{ audioEl.currentTime=0; audioEl.play().catch(()=>{}); }catch{} }
+
+    // === INTERACTIONS GLOBALES ===============================================
+    function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene,camera); }
+    animate();
+
+    window.addEventListener('resize', ()=>{
+      const w=window.innerWidth, h=window.innerHeight;
+      renderer.setSize(w,h);
+      camera.aspect=w/h; camera.updateProjectionMatrix();
+    });
+
+    function onKeyDown(e){
+      const k = e.key.toLowerCase();
+      if(k==='f') recadrerFace();
+    }
+    window.addEventListener('keydown', onKeyDown);
+
+    function recadrerFace(){
+      const bbox = computeBBox([puzzleRoot]);
+      frameFront(bbox);
+      // En mode 2D, élimine toute inclinaison parasite
+      if(!controls.enableRotate){
+        puzzleRoot.rotation.set(0,0,0);
+        keepPlanarZ0(puzzleRoot);
+      }
+    }
+
+    // Pointeurs
+    renderer.domElement.addEventListener('pointerdown', pointerDown, {passive:false});
+    window.addEventListener('pointermove', pointerMove, {passive:false});
+    window.addEventListener('pointerup',   pointerUp,   {passive:false});
+    renderer.domElement.addEventListener('touchstart',  pointerDown, {passive:false});
+    window.addEventListener('touchmove',   pointerMove, {passive:false});
+    window.addEventListener('touchend',    pointerUp,   {passive:false});
+
+    // Boutons HUD
+    const startBtn = document.getElementById('startBtn');
+    const faceBtn  = document.getElementById('faceBtn');
+
+    startBtn.addEventListener('click', ()=>{
+      // Activer le mode 3D (rotation)
+      controls.enableRotate = true;
+      controls.enabled = true;
+      // Petit tilt doux pour "montrer" la 3D
+      puzzleRoot.rotation.x = THREE.MathUtils.degToRad(5);
+      puzzleRoot.rotation.y = THREE.MathUtils.degToRad(-3);
+    });
+
+    faceBtn.addEventListener('click', recadrerFace);
+  </script>
+</body>
+</html>
