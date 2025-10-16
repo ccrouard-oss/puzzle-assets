@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-  <title>Puzzle – 2D strict ➜ 3D limitée (anti-chevauchement + snap corrigé)</title>
+  <title>Puzzle – 2D strict ➜ 3D limitée (snap bloc↔bloc fiable + anti-chevauchement)</title>
   <style>
     html,body{height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
     #app{position:fixed;inset:0}
@@ -39,48 +39,45 @@
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-    // ========= CONFIG (4:3 PORTRAIT, 2D PAR DÉFAUT) ==========================
-    const MODEL_URL = 'puzzle_50_scattered.glb';     // adapte si nécessaire
+    // ========= CONFIG =========================================================
+    const MODEL_URL = 'puzzle_50_scattered.glb'; // adapte si besoin
     const ROWS=5, COLS=10;
-    const PUZZLE_W=3.0, PUZZLE_H=4.0;                // 4:3 portrait
+    const PUZZLE_W=3.0, PUZZLE_H=4.0; // 4:3 portrait
     const CELL_W=PUZZLE_W/COLS, CELL_H=PUZZLE_H/ROWS;
 
-    // Magnétisme (plus ferme)
-    const SNAP_GRID = 0.18;        // rayon capture position cible
-    const SNAP_NEIGH_EAGER = 0.12; // rayon "aimantation immédiate" voisinage
-    const SNAP_NEIGH = 0.16;       // rayon "proche" (drag continu)
+    // Magnétisme
+    const SNAP_NEIGH_EAGER = 0.11; // snap immédiat bloc↔bloc si l’écart est vraiment faible
+    const SNAP_NEIGH = 0.18;       // tolérance bloc↔bloc (avant lerp)
+    const SNAP_GRID = 0.20;        // tolérance sur la position cible
     const POS_EPS = 0.003;
-    const LERP_DRAG = 0.6, LERP_SNAP = 0.45;
+    const LERP_DRAG = 0.6, LERP_SNAP = 0.55;
 
-    // Anti-chevauchement (distance minimale entre centres de blocs)
-    const MIN_CENTER_DIST = Math.min(CELL_W, CELL_H)*0.42;
+    // Anti-chevauchement
+    const BOUNDS_MARGIN = 0.6;
+    const COLLISION_PAD = 0.96;    // facteur d’agrégation des rayons (1 = tangence)
+    const MAX_SEP_STEP = 0.08;     // déplacement max par frame pour séparer
 
     // Profondeur limitée
-    const Z_LIMIT_2D = 0.0;      // 2D stricte
-    const Z_LIMIT_3D = 0.02;     // ±2 cm
-    const CAMERA_TILT_DEG = 6;   // tilt max en 3D
-
-    // Bornes XY pour ne pas "perdre" les pièces
-    const BOUNDS_MARGIN = 0.6;
+    const Z_LIMIT_2D = 0.0;
+    const Z_LIMIT_3D = 0.02;
+    const CAMERA_TILT_DEG = 6;
 
     // ========= SCÈNE =========================================================
     const app = document.getElementById('app');
     const scene = new THREE.Scene(); scene.background = new THREE.Color('#0d1117');
 
-    // Caméra ORTHO (2D)
+    // Caméras
     let is3D = false;
     const ortho = makeOrtho();
     function makeOrtho(){
       const aspect = window.innerWidth / window.innerHeight;
-      const viewH = PUZZLE_H * 1.15;
-      const viewW = viewH * aspect;
-      return new THREE.OrthographicCamera(-viewW/2, viewW/2, viewH/2, -viewH/2, -10, 10);
+      const viewH = PUZZLE_H * 1.15, viewW = viewH * aspect;
+      const cam = new THREE.OrthographicCamera(-viewW/2, viewW/2, viewH/2, -viewH/2, -10, 10);
+      cam.position.set(0,0,5); cam.lookAt(0,0,0);
+      return cam;
     }
-
-    // Caméra perspective (3D limitée)
     const persp = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.01, 20);
     persp.position.set(0,0,6);
-
     let camera = ortho;
 
     const renderer = new THREE.WebGLRenderer({antialias:true});
@@ -93,33 +90,39 @@
     scene.add(new THREE.HemisphereLight(0xffffff,0x223344,0.8));
     const dl = new THREE.DirectionalLight(0xffffff,0.6); dl.position.set(2,3,4); scene.add(dl);
 
-    // Contrôles
+    // Contrôles 3D limités
     const controls = new OrbitControls(persp, renderer.domElement);
     controls.enableDamping = true; controls.dampingFactor = 0.08;
-    controls.enableRotate = false; // activé en 3D
+    controls.enableRotate = false;
     controls.enablePan = true;
     controls.enableZoom = true;
-    controls.minDistance = 4.5;
-    controls.maxDistance = 8.0;
+    controls.minDistance = 4.5; controls.maxDistance = 8.0;
     const tilt = THREE.MathUtils.degToRad(CAMERA_TILT_DEG);
     controls.minPolarAngle = Math.PI/2 - tilt;
     controls.maxPolarAngle = Math.PI/2 + tilt;
 
-    // Raycast & utilitaires
+    // Raycast / pointeur
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
+    function setPointer(e){
+      const p = e.touches?.[0] || e.changedTouches?.[0] || e;
+      const rect=renderer.domElement.getBoundingClientRect();
+      pointer.x=((p.clientX-rect.left)/rect.width)*2-1;
+      pointer.y=-((p.clientY-rect.top)/rect.height)*2+1;
+      return p;
+    }
 
-    // Puzzle
+    // Root & structures
     const puzzleRoot = new THREE.Group(); scene.add(puzzleRoot);
     const pickableMeshes = [];
-    const entriesByName = new Map();
-    const entries = [];
+    const entries = [];              // {group, mesh, rc:{r,c}, target:Vector3, placed:boolean}
+    const entryByKey = new Map();    // "rX_cY" -> entry
 
     const x0 = -PUZZLE_W/2 + CELL_W/2;
     const y0 =  PUZZLE_H/2 - CELL_H/2;
     const targetOf = (rc)=> new THREE.Vector3(x0 + rc.c*CELL_W, y0 - rc.r*CELL_H, 0);
 
-    // ======== CHARGEMENT & NORMALISATION FACE ================================
+    // ======== CHARGEMENT GLB ================================================
     const loader = new GLTFLoader();
     loader.load(MODEL_URL, (gltf)=>{
       const root = gltf.scene;
@@ -130,30 +133,26 @@
           for(const m of mats){ if(m){ m.side = THREE.FrontSide; } }
         }
       });
-      // Aplatir et corriger une éventuelle orientation "tranche"
       orientFaceOn(root);
 
-      // Chaque pièce devient un "bloc" (group enfant de puzzleRoot)
       for(const rNode of uniqueRootsUnder(root)){
         const rc = parseRC(rNode.name) || {r:0,c:0};
         const block = reparentAsBlock(rNode, puzzleRoot);
         const entry = { group:block, mesh:rNode, rc, target:targetOf(rc), placed:false };
         entries.push(entry);
-        entriesByName.set(`r${rc.r}_c${rc.c}`, entry);
+        entryByKey.set(keyOf(rc), entry);
       }
 
-      forcePlanarZ(puzzleRoot, 0);
+      forcePlanarZ(puzzleRoot,0);
       updateHUD();
       frame2D();
     }, undefined, err=>console.error(err));
 
     function orientFaceOn(root){
-      root.rotation.set(0,0,0);
-      root.updateMatrixWorld(true);
+      root.rotation.set(0,0,0); root.updateMatrixWorld(true);
       const bbox = new THREE.Box3().setFromObject(root);
       if(bbox.getSize(new THREE.Vector3()).z > 0.2){
-        root.rotation.x = Math.PI/2;
-        root.updateMatrixWorld(true);
+        root.rotation.x = Math.PI/2; root.updateMatrixWorld(true);
       }
     }
     function uniqueRootsUnder(root){
@@ -164,45 +163,177 @@
       }
       return [...set];
     }
-    function parseRC(name=''){
-      const m = /r(\d+)_c(\d+)/i.exec(name);
-      return m? {r:+m[1], c:+m[2]} : null;
-    }
+    function parseRC(name=''){ const m = /r(\d+)_c(\d+)/i.exec(name); return m? {r:+m[1],c:+m[2]}:null; }
+    function keyOf(rc){ return `r${rc.r}_c${rc.c}`; }
+
     function reparentAsBlock(node, parent){
-      const block = new THREE.Group();
-      parent.add(block);
+      const block = new THREE.Group(); parent.add(block);
       node.updateMatrixWorld(true);
       const wp = new THREE.Vector3(); node.getWorldPosition(wp);
       const wq = new THREE.Quaternion(); node.getWorldQuaternion(wq);
       block.position.copy(wp); block.quaternion.copy(wq); block.scale.set(1,1,1);
-      block.add(node);
-      node.position.set(0,0,0); node.quaternion.identity(); node.scale.set(1,1,1);
+      block.add(node); node.position.set(0,0,0); node.quaternion.identity(); node.scale.set(1,1,1);
       return block;
     }
 
-    // ======== DRAG/SNAP/COLLISION ===========================================
+    // ======== BLOCS / MEMBRES / COLLISION RADIUS ============================
+    function findBlock(g){ let n=g; while(n.parent && n.parent!==puzzleRoot) n=n.parent; return n||g; }
+    function blockMembers(block){
+      // toutes les entries qui pointent vers ce bloc (racine)
+      const r = findBlock(block);
+      return entries.filter(e => findBlock(e.group)===r);
+    }
+    function blockCenter(block){
+      // centre géométrique (bbox du bloc)
+      const bbox = new THREE.Box3().setFromObject(block);
+      return bbox.getCenter(new THREE.Vector3());
+    }
+    function blockRadius(block){
+      // rayon de collision depuis la bbox (demi-diagonale dans XY)
+      const bbox = new THREE.Box3().setFromObject(block);
+      const size = bbox.getSize(new THREE.Vector3());
+      const rx = size.x*0.5, ry = size.y*0.5;
+      return Math.sqrt(rx*rx + ry*ry);
+    }
+
+    // ======== NEIGHBORS LOGIQUES & SNAP =====================================
+    function neighRCs(rc){
+      const list=[];
+      if(rc.r>0)      list.push({r:rc.r-1,c:rc.c, dx:0,        dy:+CELL_H});
+      if(rc.r<ROWS-1) list.push({r:rc.r+1,c:rc.c, dx:0,        dy:-CELL_H});
+      if(rc.c>0)      list.push({r:rc.r,  c:rc.c-1, dx:-CELL_W,dy:0});
+      if(rc.c<COLS-1) list.push({r:rc.r,  c:rc.c+1, dx:+CELL_W,dy:0});
+      return list;
+    }
+
+    // Trouve la meilleure paire (rcA ∈ bloc A, rcB voisin logique ∈ bloc B)
+    function bestNeighborPairForBlocks(blockA){
+      const membersA = blockMembers(blockA);
+      let best=null; // {entryA, entryB, dist, desired(Vector3)}
+      for(const eA of membersA){
+        const posA = findBlock(eA.group).position;
+        for(const n of neighRCs(eA.rc)){
+          const keyB = keyOf({r:n.r,c:n.c});
+          const eB = entryByKey.get(keyB);
+          if(!eB) continue;
+          const blockB = findBlock(eB.group);
+          if(blockB===findBlock(blockA)) continue;
+
+          const posB = blockB.position;
+          const desired = new THREE.Vector3(n.dx, n.dy, 0);
+          const current = new THREE.Vector3().subVectors(posB, posA);
+          const gap = current.clone().sub(desired);
+          const dist = gap.length();
+          if(best===null || dist < best.dist){
+            best = {entryA:eA, entryB:eB, dist, desired, blockB, posA, posB};
+          }
+        }
+      }
+      return best;
+    }
+
+    const audioEl = document.getElementById('snapSound');
+    function playSnap(){ try{ audioEl.currentTime=0; audioEl.play().catch(()=>{});}catch{} }
+
+    function snapBlockToPair(blockA, pair, final){
+      // on place le blockA pour respecter exactement le décalage attendu par rapport à blockB
+      const newPosA = new THREE.Vector3().subVectors(pair.posB, pair.desired);
+      if(final || pair.dist < SNAP_NEIGH_EAGER){
+        blockA.position.copy(newPosA);
+      }else{
+        blockA.position.lerp(newPosA, LERP_SNAP);
+      }
+      blockA.position.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, 0);
+
+      // condition de validation
+      const ok = blockA.position.distanceTo(newPosA) < (final? 2*POS_EPS : 0.02);
+      if(ok){
+        blockA.position.copy(newPosA);
+        blockA.position.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, 0);
+        // fusion des blocs
+        mergeBlocks(blockA, pair.blockB);
+        forcePlanarZ(findBlock(blockA), 0);
+        playSnap(); updateHUD();
+        return true;
+      }
+      return false;
+    }
+
+    function trySnapNeighborsBlock(blockA, final){
+      const pair = bestNeighborPairForBlocks(blockA);
+      if(!pair) return false;
+      if(pair.dist > (final ? 2*POS_EPS : SNAP_NEIGH)) return false;
+      return snapBlockToPair(blockA, pair, final);
+    }
+
+    function trySnapGrid(entry, final){
+      const block = findBlock(entry.group);
+      const d = block.position.distanceTo(entry.target);
+      if(!final && d>SNAP_GRID) return false;
+      const aim = entry.target.clone();
+
+      if(final || d < SNAP_NEIGH_EAGER){
+        block.position.copy(aim);
+      }else{
+        block.position.lerp(aim, LERP_SNAP);
+      }
+      block.position.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, 0);
+
+      const ok = block.position.distanceTo(aim) < (final? 2*POS_EPS : 0.02);
+      if(ok){
+        block.position.copy(aim);
+        block.position.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, 0);
+        entry.placed = true;
+        forcePlanarZ(block, 0);
+        playSnap(); updateHUD();
+        return true;
+      }
+      return false;
+    }
+
+    // ======== MERGE & UTILITAIRES ===========================================
+    function reparentKeepWorld(child, newParent){
+      const wp = new THREE.Vector3(); child.getWorldPosition(wp);
+      const wq = new THREE.Quaternion(); child.getWorldQuaternion(wq);
+      newParent.add(child);
+      child.position.copy(newParent.worldToLocal(wp));
+      const inv = newParent.getWorldQuaternion(new THREE.Quaternion()).invert();
+      child.quaternion.copy(inv.multiply(wq));
+      child.scale.set(1,1,1);
+    }
+
+    function mergeBlocks(A, B){
+      A=findBlock(A); B=findBlock(B);
+      if(A===B) return;
+      const parent = new THREE.Group(); puzzleRoot.add(parent);
+
+      const ca = blockCenter(A), cb = blockCenter(B);
+      parent.position.copy(ca.add(cb).multiplyScalar(0.5));
+
+      reparentKeepWorld(A, parent);
+      reparentKeepWorld(B, parent);
+      forcePlanarZ(parent, 0);
+
+      // Réassigner les entries sur le nouveau bloc parent
+      for(const e of entries){
+        const r = findBlock(e.group);
+        if(r===A || r===B || r===parent){ e.group = parent; }
+      }
+    }
+
+    function forcePlanarZ(root, z=0){ root.traverse(o=>{ if(o.position) o.position.z = z; }); }
+    function clampZ(limit, z){ return Math.max(-limit, Math.min(limit, z)); }
+    function clampInBounds(v){
+      const halfW = PUZZLE_W/2 + BOUNDS_MARGIN;
+      const halfH = PUZZLE_H/2 + BOUNDS_MARGIN;
+      v.x = Math.max(-halfW, Math.min(halfW, v.x));
+      v.y = Math.max(-halfH, Math.min(halfH, v.y));
+    }
+
+    // ======== DRAG / COLLISION RESOLUTION ===================================
     let dragging = null;
     const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1), 0); // z=0
 
-    function setPointer(e){
-      const p = e.touches?.[0] || e.changedTouches?.[0] || e;
-      const rect=renderer.domElement.getBoundingClientRect();
-      pointer.x=((p.clientX-rect.left)/rect.width)*2-1;
-      pointer.y=-((p.clientY-rect.top)/rect.height)*2+1;
-      return p;
-    }
-    function rayFromPointer(){
-      const r = new THREE.Ray();
-      if(camera.isOrthographicCamera){
-        const origin = new THREE.Vector3(pointer.x, pointer.y, 0).unproject(ortho);
-        const dir = new THREE.Vector3(0,0,-1).transformDirection(ortho.matrixWorld);
-        r.origin.copy(origin); r.direction.copy(dir);
-      }else{
-        raycaster.setFromCamera(pointer, persp);
-        r.copy(raycaster.ray);
-      }
-      return r;
-    }
     function intersectPickable(){
       (camera.isOrthographicCamera? raycaster.setFromCamera(pointer, camera) : raycaster.setFromCamera(pointer, persp));
       const hits = raycaster.intersectObjects(pickableMeshes, true);
@@ -218,196 +349,88 @@
       if(!n) return null;
       return entries.find(e=>e.group===n) || null;
     }
-    function findBlock(g){
-      let n=g; while(n.parent && n.parent!==puzzleRoot) n=n.parent;
-      return n||g;
-    }
-    function forcePlanarZ(root, z=0){
-      root.traverse(o=>{ if(o.position) o.position.z = z; });
-    }
-    function clampZ(limit, z){ return Math.max(-limit, Math.min(limit, z)); }
-    function clampInBounds(v){
-      const halfW = PUZZLE_W/2 + BOUNDS_MARGIN;
-      const halfH = PUZZLE_H/2 + BOUNDS_MARGIN;
-      v.x = Math.max(-halfW, Math.min(halfW, v.x));
-      v.y = Math.max(-halfH, Math.min(halfH, v.y));
-    }
 
-    // — voisinage logique (haut/bas/gauche/droite)
-    function neighRCs(rc){
-      const list=[];
-      if(rc.r>0)      list.push({r:rc.r-1,c:rc.c, dx:0,        dy:+CELL_H});
-      if(rc.r<ROWS-1) list.push({r:rc.r+1,c:rc.c, dx:0,        dy:-CELL_H});
-      if(rc.c>0)      list.push({r:rc.r,  c:rc.c-1, dx:-CELL_W,dy:0});
-      if(rc.c<COLS-1) list.push({r:rc.r,  c:rc.c+1, dx:+CELL_W,dy:0});
-      return list;
-    }
-    function isIntendedNeighbor(entry, other){
-      const rc = entry.rc;
-      return neighRCs(rc).some(n => `r${n.r}_c${n.c}` === `r${other.rc.r}_c${other.rc.c}`);
-    }
-
-    // — anti-chevauchement (résolution douce)
-    function resolveCollisionsFor(entry, ignoreForSnap=false){
-      const A = findBlock(entry.group);
-      const posA = A.position;
-      for(const e of entries){
-        const B = findBlock(e.group);
-        if(B===A) continue;
-        // Si c'est le voisin logique ET qu'on est (encore) dans une phase de snap, on ne repousse pas
-        if(!ignoreForSnap && isIntendedNeighbor(entry, e)) continue;
-        const posB = B.position;
-        const delta = new THREE.Vector3().subVectors(posA, posB);
-        const dist = delta.length();
-        if(dist < MIN_CENTER_DIST){
-          // pousse A à l’extérieur du rayon minimal
-          if(dist < 1e-6) { // même centre (rareté) : bouge légèrement
-            delta.set(Math.random()-0.5, Math.random()-0.5, 0).normalize().multiplyScalar(MIN_CENTER_DIST);
-          }else{
-            delta.multiplyScalar((MIN_CENTER_DIST - dist)/dist);
-          }
-          posA.add(delta);
-          clampInBounds(posA);
-          posA.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, posA.z);
-        }
-      }
-    }
-
-    // — SNAP GRILLE
-    const audioEl = document.getElementById('snapSound');
-    function playSnap(){ try{ audioEl.currentTime=0; audioEl.play().catch(()=>{});}catch{} }
-
-    function trySnapGrid(entry, final){
-      const d = entry.group.position.distanceTo(entry.target);
-      if(!final && d>SNAP_GRID) return false;
-      const aim = entry.target.clone();
-
-      if(final || d < SNAP_NEIGH_EAGER){
-        entry.group.position.copy(aim);
-      }else{
-        entry.group.position.lerp(aim, LERP_SNAP);
-      }
-      entry.group.position.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, 0);
-
-      const ok = entry.group.position.distanceTo(aim) < (final? 2*POS_EPS : 0.02);
-      if(ok){
-        entry.group.position.copy(aim);
-        entry.group.position.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, 0);
-        entry.placed = true;
-        forcePlanarZ(findBlock(entry.group), 0);
-        playSnap(); updateHUD();
-        return true;
-      }
-      return false;
-    }
-
-    // — SNAP VOISINAGE avec “eager snap” (évite la répulsion)
-    function trySnapNeighbors(entry, final){
-      const rc = entry.rc;
-      const posA = entry.group.position;
-
-      for(const n of neighRCs(rc)){
-        const nb = entriesByName.get(`r${n.r}_c${n.c}`);
-        if(!nb) continue;
-
-        const blockA = findBlock(entry.group);
-        const blockB = findBlock(nb.group);
-        if(blockA===blockB) continue;
-
-        const posB = nb.group.position;
-        const desired = new THREE.Vector3(n.dx, n.dy, 0);
-        const current = new THREE.Vector3().subVectors(posB, posA);
-        const dist = current.clone().sub(desired).length();
-
-        // seuil "eager": on aimante immédiatement (pas de lerp), pas de collision repel
-        const eager = dist < SNAP_NEIGH_EAGER;
-        const near  = dist < (final? 2*POS_EPS : SNAP_NEIGH);
-
-        if(eager || near){
-          const newPosA = new THREE.Vector3().subVectors(posB, desired);
-          if(eager || final){
-            entry.group.position.copy(newPosA);
-          }else{
-            entry.group.position.lerp(newPosA, LERP_SNAP);
-          }
-          entry.group.position.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, 0);
-
-          // fusion bloc↔bloc
-          mergeBlocks(blockA, blockB);
-          forcePlanarZ(findBlock(entry.group), 0);
-          playSnap(); updateHUD();
-          return true;
-        }
-      }
-      return false;
-    }
-
-    function mergeBlocks(A, B){
-      if(A===B) return;
-      const parent = new THREE.Group(); puzzleRoot.add(parent);
-      const pa = new THREE.Vector3(); A.getWorldPosition(pa);
-      const pb = new THREE.Vector3(); B.getWorldPosition(pb);
-      parent.position.copy(pa.add(pb).multiplyScalar(0.5));
-      reparentKeepWorld(A, parent);
-      reparentKeepWorld(B, parent);
-      forcePlanarZ(parent, 0);
-      for(const e of entries){
-        const r = findBlock(e.group);
-        if(r===A || r===B || r===parent){ e.group = parent; }
-      }
-    }
-    function reparentKeepWorld(child, newParent){
-      const wp = new THREE.Vector3(); child.getWorldPosition(wp);
-      const wq = new THREE.Quaternion(); child.getWorldQuaternion(wq);
-      newParent.add(child);
-      child.position.copy(newParent.worldToLocal(wp));
-      const inv = newParent.getWorldQuaternion(new THREE.Quaternion()).invert();
-      child.quaternion.copy(inv.multiply(wq));
-      child.scale.set(1,1,1);
-    }
-
-    // ======== INPUTS =========================================================
     function pointerDown(e){
       e.preventDefault();
       setPointer(e);
-      const entry = intersectPickable();
-      if(!entry) return;
-      dragging = entry;
+      const ePick = intersectPickable();
+      if(!ePick) return;
+      dragging = ePick;
       controls.enabled = false;
     }
+
+    function moveBlockToward(block, target){
+      block.position.lerp(target, LERP_DRAG);
+      clampInBounds(block.position);
+      block.position.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, block.position.z);
+    }
+
+    function resolveBlockCollisions(block){
+      const A = findBlock(block);
+      const cA = A.position;
+      const rA = blockRadius(A);
+      for(const otherEntry of entries){
+        const B = findBlock(otherEntry.group);
+        if(B===A) continue;
+        const cB = B.position;
+        const rB = blockRadius(B);
+        const minDist = (rA + rB) * COLLISION_PAD;
+        const delta = new THREE.Vector3().subVectors(cA, cB);
+        const d = delta.length();
+        if(d < minDist && d > 1e-5){
+          const push = (minDist - d);
+          const step = Math.min(push, MAX_SEP_STEP);
+          delta.normalize().multiplyScalar(step);
+          cA.add(delta);
+          clampInBounds(cA);
+          cA.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, cA.z);
+        }
+      }
+    }
+
     function pointerMove(e){
       if(!dragging) return;
       e.preventDefault();
       setPointer(e);
 
-      // Projection du pointeur sur le plan z=0
-      const ray = rayFromPointer();
+      // pointer -> rayon -> plan z=0
+      const ray = new THREE.Ray();
+      if(camera.isOrthographicCamera){
+        const origin = new THREE.Vector3(pointer.x, pointer.y, 0).unproject(ortho);
+        const dir = new THREE.Vector3(0,0,-1).transformDirection(ortho.matrixWorld);
+        ray.origin.copy(origin); ray.direction.copy(dir);
+      }else{
+        raycaster.setFromCamera(pointer, persp); ray.copy(raycaster.ray);
+      }
       const hit = new THREE.Vector3();
       if(!ray.intersectPlane(dragPlane, hit)) return;
 
-      // Pos cible (douce), bornes et Z limité
-      const pos = dragging.group.position;
-      pos.lerp(hit, LERP_DRAG);
-      clampInBounds(pos);
-      pos.z = clampZ(is3D? Z_LIMIT_3D : Z_LIMIT_2D, pos.z);
+      const block = findBlock(dragging.group);
+      moveBlockToward(block, hit);
 
-      // 1) Tentative d’aimantation VOISINAGE (eager) – n’applique pas de collision repel si ça snap
-      const snappedNeighbor = trySnapNeighbors(dragging, false);
-      if(snappedNeighbor) return; // on a fusionné; inutile de pousser
+      // 1) Essayer un snap bloc↔bloc (voisinage logique “meilleure paire”)
+      if(trySnapNeighborsBlock(block, false)) return;
 
-      // 2) Tentative de snap GRILLE (douce)
-      const snappedGrid = trySnapGrid(dragging, false);
-      if(snappedGrid) return;
+      // 2) Essayer snap grille sur la pièce “dragging”
+      if(trySnapGrid(dragging, false)) return;
 
-      // 3) Sinon, résoudre les collisions (repoussement doux)
-      resolveCollisionsFor(dragging, /*ignoreForSnap=*/false);
+      // 3) Résoudre les collisions restantes (séparation douce)
+      resolveBlockCollisions(block);
     }
+
     function pointerUp(e){
       if(!dragging) return;
       e.preventDefault();
 
-      // Dernières tentatives fermes (voisinage puis grille)
-      if(!trySnapNeighbors(dragging, true)) trySnapGrid(dragging, true);
+      const block = findBlock(dragging.group);
+
+      // tentatives fermes
+      if(!trySnapNeighborsBlock(block, true)){
+        trySnapGrid(dragging, true);
+      }
+
+      // post: s'assurer qu’on ne chevauche plus personne
+      resolveBlockCollisions(block);
 
       dragging = null;
       controls.enabled = is3D;
@@ -422,23 +445,12 @@
       const nPlaced = entries.filter(e=>e.placed).length;
       placedInfo.textContent = `${nPlaced} placées`;
       const blk = dragging? findBlock(dragging.group) : null;
-      groupInfo.textContent = `Bloc: ${blk? countPieces(blk):1} pièce${(blk&&countPieces(blk)>1)?'s':''}`;
-    }
-    function countPieces(block){
-      let c=0; for(const e of entries){ if(findBlock(e.group)===findBlock(block)) c++; }
-      return c||1;
+      groupInfo.textContent = `Bloc: ${blk? blockMembers(blk).length:1} pièce${(blk&&blockMembers(blk).length>1)?'s':''}`;
     }
 
-    function frame2D(){
-      camera = ortho;
-      modeInfo.textContent = 'Mode: 2D';
-      ortho.position.set(0,0,5);
-      ortho.lookAt(0,0,0);
-      forcePlanarZ(puzzleRoot, 0);
-    }
+    function frame2D(){ camera = ortho; modeInfo.textContent = 'Mode: 2D'; forcePlanarZ(puzzleRoot, 0); }
     function frame3D(){
-      camera = persp;
-      modeInfo.textContent = 'Mode: 3D limité';
+      camera = persp; modeInfo.textContent = 'Mode: 3D limité';
       puzzleRoot.rotation.set(THREE.MathUtils.degToRad(4), THREE.MathUtils.degToRad(-3), 0);
       controls.update();
     }
@@ -448,9 +460,8 @@
 
     window.addEventListener('resize', ()=>{
       const aspect = window.innerWidth / window.innerHeight;
-      const viewH = PUZZLE_H * 1.15;
-      const viewW = viewH * aspect;
-      ortho.left = -viewW/2; ortho.right = viewW/2; ortho.top = viewH/2; ortho.bottom = -viewH/2;
+      const viewH = PUZZLE_H * 1.15, viewW = viewH * aspect;
+      ortho.left=-viewW/2; ortho.right=viewW/2; ortho.top=viewH/2; ortho.bottom=-viewH/2;
       ortho.updateProjectionMatrix();
       persp.aspect = aspect; persp.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
