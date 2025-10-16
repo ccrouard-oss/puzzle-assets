@@ -51,22 +51,22 @@
     <button class="btn" id="shuffleBtn">Mélanger</button>
   </div>
 
-  <!-- Son : uniquement déclenché quand une pièce est à sa place -->
+  <!-- Son : uniquement déclenché quand une pièce est posée à la bonne place -->
   <audio id="snapSound" src="https://ccrouard-oss.github.io/puzzle-assets/click.wav" preload="auto"></audio>
 
   <script type="module">
     import * as THREE from 'three';
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-    // ========= CONFIG ========================================================
+    // ========= CONFIG (portrait 4:3) ========================================
     const MODEL_URL = 'puzzle_50_scattered.glb'; // même dossier que ce fichier
     const ROWS=5, COLS=10;
-    const PUZZLE_W=3.0, PUZZLE_H=4.0;              // 4:3 portrait
+    const PUZZLE_W=3.0, PUZZLE_H=4.0;              // 4:3 portrait (W<H)
     const CELL_W=PUZZLE_W/COLS, CELL_H=PUZZLE_H/ROWS;
 
     // Déplacement & aimantation
     const POS_EPS = 0.003;
-    const LERP_DRAG = 0.12;        // <-- plus lent / naturel
+    const LERP_DRAG = 0.10;        // plus lent / naturel
     const LERP_SNAP = 0.5;
     const SNAP_GRID = 0.18;
     const SNAP_NEIGH_EAGER = 0.14;
@@ -76,22 +76,47 @@
     // Distance min. entre centres pour éviter le chevauchement
     const MIN_CENTER_DIST = Math.min(CELL_W, CELL_H)*0.42;
 
-    // Zone de jeu
+    // Bornes XY de l'aire de jeu (autour du centre)
     const BOUNDS_MARGIN = 0.6;
 
     // ========= SCÈNE =========================================================
     const app = document.getElementById('app');
     const scene = new THREE.Scene(); scene.background = new THREE.Color('#0d1117');
 
-    // Caméra orthographique (recadrée par frameToContent)
+    // --- Caméra orthographique "portrait" figée, centrée sur (0,0) ----------
+    // On ne recadre plus sur le contenu : format portrait garanti, toujours centré.
+    const PORTRAIT_MARGIN = 1.12; // marge pour respirer autour du puzzle
+    function setPortraitView(){
+      const aspect = window.innerWidth / window.innerHeight; // canvas
+      const puzzleAspect = PUZZLE_W / PUZZLE_H;  // 3/4 = 0.75 (portrait)
+      const targetW = PUZZLE_W * PORTRAIT_MARGIN;
+      const targetH = PUZZLE_H * PORTRAIT_MARGIN;
+
+      // On adapte le frustum pour conserver le format portrait
+      // et cadrer le puzzle entier, sans jamais zoomer sur du paysage.
+      let viewW, viewH;
+      // On veut respecter le ratio du canvas pour éviter toute déformation,
+      // tout en affichant au moins le rectangle portrait targetW x targetH.
+      if ((targetW / targetH) > aspect) {
+        // le canvas est "plus étroit" verticalement -> on étend en hauteur
+        viewW = targetW;
+        viewH = targetW / aspect;
+      } else {
+        // le canvas est "plus large" -> on étend en largeur
+        viewH = targetH;
+        viewW = targetH * aspect;
+      }
+
+      camera.left = -viewW/2; camera.right = viewW/2;
+      camera.top  =  viewH/2; camera.bottom = -viewH/2;
+      camera.position.set(0,0,5);     // centre exact
+      camera.lookAt(0,0,0);
+      camera.updateProjectionMatrix();
+    }
+
     function makeOrtho(){
-      const aspect = window.innerWidth / window.innerHeight;
-      const viewH = PUZZLE_H * 1.2;
-      const viewW = viewH * aspect;
-      const cam = new THREE.OrthographicCamera(-viewW/2, viewW/2, viewH/2, -viewH/2, -10, 10);
-      cam.position.set(0,0,5);
-      cam.lookAt(0,0,0);
-      return cam;
+      // valeurs provisoires, setPortraitView() fera le cadrage exact
+      return new THREE.OrthographicCamera(-2, 2, 2, -2, -10, 10);
     }
     const camera = makeOrtho();
 
@@ -109,11 +134,13 @@
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
 
+    // Racine puzzle
     const puzzleRoot = new THREE.Group(); scene.add(puzzleRoot);
     const pickableMeshes = [];
     const entriesByName = new Map();
     const entries = [];
 
+    // Grille cible (où chaque pièce doit aller)
     const x0 = -PUZZLE_W/2 + CELL_W/2;
     const y0 =  PUZZLE_H/2 - CELL_H/2;
     const targetOf = (rc)=> new THREE.Vector3(x0 + rc.c*CELL_W, y0 - rc.r*CELL_H, 0);
@@ -128,36 +155,6 @@
       const inv = newParent.getWorldQuaternion(new THREE.Quaternion()).invert();
       child.quaternion.copy(inv.multiply(wq));
       child.scale.set(1,1,1);
-    }
-    // BBox → centrage caméra sur le contenu courant (toutes pièces/blocs)
-    function frameToContent(margin = 1.15) {
-      const groups = new Set();
-      for (const e of entries) groups.add(findBlock(e.group));
-      if (groups.size === 0) return;
-
-      const box = new THREE.Box3();
-      for (const g of groups) {
-        const pos = new THREE.Vector3(); g.getWorldPosition(pos);
-        box.expandByPoint(pos);
-      }
-      let w = box.max.x - box.min.x;
-      let h = box.max.y - box.min.y;
-      if (w < 1e-4) w = PUZZLE_W;
-      if (h < 1e-4) h = PUZZLE_H;
-      w *= margin; h *= margin;
-
-      const center = box.getCenter(new THREE.Vector3());
-      const aspect = window.innerWidth / window.innerHeight;
-
-      let viewW, viewH;
-      if (w / h > aspect) { viewW = w; viewH = w / aspect; }
-      else { viewH = h; viewW = h * aspect; }
-
-      camera.left = -viewW / 2; camera.right = viewW / 2;
-      camera.top  =  viewH / 2; camera.bottom = -viewH / 2;
-      camera.position.set(center.x, center.y, 5);
-      camera.lookAt(center);
-      camera.updateProjectionMatrix();
     }
 
     // ========= CHARGEMENT GLB ===============================================
@@ -183,9 +180,9 @@
 
       forcePlanarZ(puzzleRoot, 0);
 
-      // Mélange initial centré, sans chevauchement
+      // Mélange initial : centré, sans chevauchement (grille autour de 0,0)
       shufflePieces();
-      frameToContent();
+      setPortraitView();   // <<< vue figée portrait au centre
       updateHUD();
       render();
     }, undefined, err=>console.error(err));
@@ -305,7 +302,7 @@
       }
     }
 
-    // Son "snap" seulement quand une pièce est posée correctement
+    // Son "snap" uniquement quand une pièce est posée correctement
     const audioEl = document.getElementById('snapSound');
     function playSnap(){
       if(!audioEl) return;
@@ -345,7 +342,6 @@
       const rc = entry.rc;
       const posA = entry.group.position;
 
-      // garder l'accroche si déjà collé à un voisin
       if(entry.stickyTo){
         const { nbKey, desired } = entry.stickyTo;
         const nb = entriesByName.get(nbKey);
@@ -365,7 +361,6 @@
         }
       }
 
-      // meilleur voisin
       let best = null;
       for(const n of neighRCs(rc)){
         const nb = entriesByName.get(`r${n.r}_c${n.c}`);
@@ -409,7 +404,6 @@
       reparentKeepWorld(A, parent);
       reparentKeepWorld(B, parent);
       forcePlanarZ(parent, 0);
-
       parent.userData.locked = document.getElementById('lockAfterMerge').checked;
 
       for(const e of entries){
@@ -482,7 +476,7 @@
       e.preventDefault();
       if(!trySnapNeighbors(dragging, true)) trySnapGrid(dragging, true);
       dragging = null;
-      frameToContent(); // recadre doucement après action
+      // ❌ NE PAS recentrer la caméra : on conserve le portrait figé centré
     }
 
     const placedInfo = document.getElementById('placedInfo');
@@ -502,17 +496,17 @@
 
     function render(){ requestAnimationFrame(render); updateHUD(); renderer.render(scene, camera); }
 
-    // Resize → recadre et recentre le puzzle
+    // Resize → on adapte le frustum mais on garde le portrait centré
     window.addEventListener('resize', ()=>{
       renderer.setSize(window.innerWidth, window.innerHeight);
-      frameToContent();
+      setPortraitView();
     });
 
-    // Bouton "Mélanger" centré, sans chevauchement
+    // Bouton "Mélanger" : centré, sans chevauchement, pas de recadrage caméra
     document.getElementById('shuffleBtn').addEventListener('click', ()=>{
       shufflePieces();
       updateHUD();
-      frameToContent();
+      // caméra figée → pas d'appel à un recadrage dynamique ici
     });
 
     // Inputs
