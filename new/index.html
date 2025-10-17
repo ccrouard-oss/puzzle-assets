@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Puzzle – Protect the Oceans</title>
+  <style>
+    html, body { height:100%; margin:0; background:#f6f8fb; }
+    body { display:grid; place-items:center; font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    .toolbar {
+      position:fixed; top:12px; left:50%; transform:translateX(-50%);
+      background:#fff; border:1px solid #e3e7ee; border-radius:999px;
+      padding:6px 10px; box-shadow:0 6px 24px rgba(0,0,0,.06); display:flex; gap:8px;
+    }
+    .toolbar button {
+      border:0; background:#0e7afe; color:#fff; border-radius:999px; padding:8px 14px; cursor:pointer;
+    }
+    canvas {
+      background:#fff; border:1px solid #e3e7ee; border-radius:12px;
+      box-shadow:0 10px 32px rgba(0,0,0,.08); touch-action:none;
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button id="shuffle">Mélanger</button>
+    <button id="reset">Réinitialiser</button>
+  </div>
+
+  <!-- Portrait 4:3 : 600x800 -->
+  <canvas id="puzzle" width="600" height="800"></canvas>
+
+  <script type="module">
+    import { OceanPuzzle } from './puzzle.js';
+
+    const canvas = document.getElementById('puzzle');
+    const engine = new OceanPuzzle(canvas, {
+      rows: 5,                 // 5 x 10 = 50 pièces
+      cols: 10,
+      maxStepPerFrame: 12,
+      dragLerp: 0.25,
+      snapDistance: 16,
+      lockOnSnap: true,
+      viewPadding: 24,
+      noOverlap: true,
+      imageUrl: './protect_the_oceans.png', // 4:3 portrait inchangé
+      soundUrl: './click.wav'               // son lors d'un snap réussi
+    });
+
+    await engine.init();
+    engine.shuffle(); // mélange au démarrage
+    engine.start();
+
+    document.getElementById('shuffle').addEventListener('click', () => engine.shuffle());
+    document.getElementById('reset').addEventListener('click', () => engine.reset());
+  </script>
+</body>
+</html>
