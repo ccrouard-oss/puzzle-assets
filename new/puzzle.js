@@ -1,4 +1,4 @@
-// puzzle.js — drag fiable en iframe + bords extérieurs droits + ajustement parfait
+// puzzle.js — bords extérieurs droits, arêtes partagées correctes, drag solide
 
 export class OceanPuzzle {
   constructor(canvas, opts = {}) {
@@ -24,26 +24,22 @@ export class OceanPuzzle {
     this.groups = new Map();
     this.pieceToGroup = new Map();
     this.drag = null;                       // { groupId, offsetX, offsetY, target:{x,y} }
-    this.pointer = { x:0, y:0, down:false };
     this.bounds = { x:0, y:0, w:canvas.width, h:canvas.height };
     this.cell = { w:0, h:0 };
     this._raf = 0;
     this._running = false;
 
     // arêtes partagées (évite les trous)
-    this.hEdges = []; // [r][c]: polyline gauche→droite (haut)
-    this.vEdges = []; // [c][r]: polyline haut→bas (gauche)
+    this.hEdges = []; // [r][c]: polyline gauche→droite (haut du carreau)
+    this.vEdges = []; // [c][r]: polyline haut→bas   (gauche du carreau)
 
-    // Écouteurs sur le CANVAS (fiable dans un <iframe>)
+    // Bind handlers (pour pouvoir add/remove facilement)
     this._onDown = (e) => { e.preventDefault(); this._handleDown(e); };
     this._onMove = (e) => { e.preventDefault(); this._handleMove(e); };
     this._onUp   = (e) => { e.preventDefault(); this._handleUp(e); };
 
+    // Écouteurs de base
     canvas.addEventListener('pointerdown', this._onDown, { passive:false });
-    canvas.addEventListener('pointermove', this._onMove,  { passive:false });
-    canvas.addEventListener('pointerup',   this._onUp,    { passive:false });
-    canvas.addEventListener('pointercancel', this._onUp,  { passive:false });
-    canvas.addEventListener('lostpointercapture', this._onUp, { passive:false });
   }
 
   async init() {
@@ -54,7 +50,7 @@ export class OceanPuzzle {
     this.image = img;
     this.clickSound = audio;
 
-    // Respect strict du format (image 4:3 portrait)
+    // Respect strict du 4:3 portrait (sans étirer)
     const innerW = this.canvas.width - this.viewPadding*2;
     const innerH = this.canvas.height - this.viewPadding*2;
     const scale  = Math.min(innerW / this.image.width, innerH / this.image.height);
@@ -63,7 +59,7 @@ export class OceanPuzzle {
     const ox = Math.floor((this.canvas.width  - drawW)/2);
     const oy = Math.floor((this.canvas.height - drawH)/2);
 
-    // tailles entières → pas de “jours”
+    // tailles entières → pas de micro-jours
     this.cell.w = Math.floor(drawW / this.cols);
     this.cell.h = Math.floor(drawH / this.rows);
     this.bounds = { x: ox, y: oy, w: this.cell.w*this.cols, h: this.cell.h*this.rows };
@@ -105,16 +101,16 @@ export class OceanPuzzle {
     if (this.noOverlap) this._separateGroups();
   }
 
-  // ---------- Arêtes partagées (bords droits) ----------
+  // ---------- Arêtes partagées (bords extérieurs droits) ----------
   _buildSharedEdges() {
     this.hEdges = Array.from({length: this.rows+1}, () => Array(this.cols).fill(null));
     this.vEdges = Array.from({length: this.cols+1}, () => Array(this.rows).fill(null));
 
-    const N = 12;
-    const ampX = Math.max(4, Math.floor(this.cell.h * 0.08));
-    const ampY = Math.max(4, Math.floor(this.cell.w * 0.08));
+    const N = 12; // points par arête
+    const ampX = Math.max(4, Math.floor(this.cell.h * 0.08)); // ondulation verticale pour horizontales
+    const ampY = Math.max(4, Math.floor(this.cell.w * 0.08)); // ondulation horizontale pour verticales
 
-    // horizontales
+    // horizontales (r = 0..rows)
     for (let r=0; r<=this.rows; r++){
       for (let c=0; c<this.cols; c++){
         const isBorder = (r===0 || r===this.rows);
@@ -122,22 +118,20 @@ export class OceanPuzzle {
         for (let i=0;i<=N;i++){
           const t = i/N;
           const x = Math.round(t * this.cell.w);
-          const y = isBorder ? 0
-            : Math.round(Math.sin((t*2*Math.PI) + (r*31 + c*17)) * ampX);
+          const y = isBorder ? 0 : Math.round(Math.sin((t*2*Math.PI) + (r*31 + c*17)) * ampX);
           poly.push({x,y});
         }
         this.hEdges[r][c] = poly;
       }
     }
-    // verticales
+    // verticales (c = 0..cols)
     for (let c=0; c<=this.cols; c++){
       for (let r=0; r<this.rows; r++){
         const isBorder = (c===0 || c===this.cols);
         const poly = [];
         for (let i=0;i<=N;i++){
           const t = i/N;
-          const x = isBorder ? 0
-            : Math.round(Math.sin((t*2*Math.PI) + (c*37 + r*19)) * ampY);
+          const x = isBorder ? 0 : Math.round(Math.sin((t*2*Math.PI) + (c*37 + r*19)) * ampY);
           const y = Math.round(t * this.cell.h);
           poly.push({x,y});
         }
@@ -146,7 +140,7 @@ export class OceanPuzzle {
     }
   }
 
-  // ---------- Pièces ----------
+  // ---------- Pièces (chemin fermé) ----------
   _createPieces() {
     this.pieces.length = 0;
     let id = 0;
@@ -158,19 +152,24 @@ export class OceanPuzzle {
 
         const pathFn = (ctx) => {
           ctx.beginPath();
-          // TOP (→)
+
+          // TOP (→) : hEdges[r][c]
           let poly = this.hEdges[r][c];
           ctx.moveTo(poly[0].x, poly[0].y);
           for (let i=1;i<poly.length;i++) ctx.lineTo(poly[i].x, poly[i].y);
-          // RIGHT (↓) décalé à x=W
+
+          // RIGHT (↓) : vEdges[c+1][r] à x = W
           poly = this.vEdges[c+1][r];
           for (let i=1;i<poly.length;i++) ctx.lineTo(this.cell.w + poly[i].x, poly[i].y);
-          // BOTTOM (←) inversé, décalé y=H
+
+          // ❗ BOTTOM (←) : hEdges[r+1][c] en ordre inversé, y = H **+ poly.y** (et NON H - poly.y)
           poly = this.hEdges[r+1][c];
-          for (let i=poly.length-2;i>=0;i--) ctx.lineTo(poly[i].x, this.cell.h - poly[i].y);
-          // LEFT (↑) inversé, x=0
+          for (let i=poly.length-2;i>=0;i--) ctx.lineTo(poly[i].x, this.cell.h + poly[i].y);
+
+          // ❗ LEFT (↑) : vEdges[c][r] en ordre inversé, x = **poly.x** (et NON -poly.x)
           poly = this.vEdges[c][r];
-          for (let i=poly.length-2;i>=0;i--) ctx.lineTo(-poly[i].x, poly[i].y);
+          for (let i=poly.length-2;i>=0;i--) ctx.lineTo(poly[i].x, poly[i].y);
+
           ctx.closePath();
         };
 
@@ -195,11 +194,21 @@ export class OceanPuzzle {
     }
   }
 
-  // ---------- Events (canvas local) ----------
+  // ---------- Drag (écouteurs sur document pendant le drag) ----------
+  _attachDocListeners() {
+    document.addEventListener('pointermove', this._onMove, { passive:false });
+    document.addEventListener('pointerup',   this._onUp,   { passive:false });
+    document.addEventListener('pointercancel', this._onUp, { passive:false });
+  }
+  _detachDocListeners() {
+    document.removeEventListener('pointermove', this._onMove);
+    document.removeEventListener('pointerup',   this._onUp);
+    document.removeEventListener('pointercancel', this._onUp);
+  }
+
   _handleDown(e){
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
-    this.pointer = { x, y, down:true };
 
     const hit = this._hitTest(x,y);
     if (!hit) return;
@@ -219,25 +228,24 @@ export class OceanPuzzle {
     const members = new Set(g.members);
     this.groups.delete(gid);
     this.groups.set(gid, { id: gid, members, pos:{x:g.pos.x, y:g.pos.y} });
+
+    this._attachDocListeners();
   }
 
   _handleMove(e){
+    if (!this.drag) return;
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
-    this.pointer.x = x; this.pointer.y = y;
-
-    if (this.drag) {
-      this.drag.target.x = Math.round(x - this.drag.offsetX);
-      this.drag.target.y = Math.round(y - this.drag.offsetY);
-    }
+    this.drag.target.x = Math.round(x - this.drag.offsetX);
+    this.drag.target.y = Math.round(y - this.drag.offsetY);
   }
 
   _handleUp(e){
-    this.pointer.down = false;
     if (!this.drag) return;
     const movedG = this.groups.get(this.drag.groupId);
     this._trySnapAndMerge(movedG);
     this.drag = null;
+    this._detachDocListeners();
   }
 
   // ---------- Update/Draw ----------
@@ -252,6 +260,7 @@ export class OceanPuzzle {
       g.pos.x = Math.round(g.pos.x + dx);
       g.pos.y = Math.round(g.pos.y + dy);
     }
+    this._draw();
   }
 
   _draw() {
